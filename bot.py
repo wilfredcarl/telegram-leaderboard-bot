@@ -142,31 +142,81 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
-# --- Inline Keyboards ---
+# --- Professional UI Keyboards ---
+def home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Monthly", callback_data="lb:month"),
+            InlineKeyboardButton("🕰 All-Time", callback_data="lb:all"),
+        ],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="nav:stats"),
+            InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ Help", callback_data="nav:help"),
+        ],
+    ])
+
+
 def leaderboard_keyboard(view: str) -> InlineKeyboardMarkup:
     # view: "month" or "all"
     if view == "all":
-        buttons = [
-            [InlineKeyboardButton("📅 This Month", callback_data="lb:month")],
-            [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
-            [InlineKeyboardButton("📖 Help", callback_data="nav:help")],
-        ]
+        switch = InlineKeyboardButton("🏆 View Monthly", callback_data="lb:month")
     else:
-        buttons = [
-            [InlineKeyboardButton("🕰 All-Time", callback_data="lb:all")],
-            [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
-            [InlineKeyboardButton("📖 Help", callback_data="nav:help")],
-        ]
-    return InlineKeyboardMarkup(buttons)
+        switch = InlineKeyboardButton("🕰 View All-Time", callback_data="lb:all")
 
-
-def help_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏆 Leaderboard (Month)", callback_data="lb:month")],
-        [InlineKeyboardButton("🕰 Leaderboard (All-Time)", callback_data="lb:all")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
-        [InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof")],
+        [switch],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="nav:stats"),
+            InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof"),
+        ],
+        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
     ])
+
+
+def secondary_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Monthly", callback_data="lb:month"),
+            InlineKeyboardButton("🕰 All-Time", callback_data="lb:all"),
+        ],
+        [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+    ])
+
+
+# --- UI Text ---
+def help_text() -> str:
+    return (
+        "📌 *Leaderboard Bot — Command Center*\n\n"
+        "*Leaderboards*\n"
+        "• `/leaderboard` — Monthly Top 10\n"
+        "• `/leaderboard all` — All-time Top 10\n\n"
+        "*Stats*\n"
+        "• `/stats` — Your totals\n\n"
+        "*History*\n"
+        "• `/hof` — Hall of Fame (Top 3 each month)\n\n"
+        "*Admin*\n"
+        "• `/forceaward` — Award pending messages\n\n"
+        "⏳ Messages count *24 hours after posting*."
+    )
+
+
+# --- Rank badges (medals + “animated-friendly” emojis) ---
+# Note: Telegram's “animated emoji” effect depends on client and context.
+# Using 🥇🥈🥉 gives the classic medal look; many clients animate these when sent.
+def rank_badge(i: int) -> str:
+    if i == 1:
+        return "🥇"
+    if i == 2:
+        return "🥈"
+    if i == 3:
+        return "🥉"
+    keycaps = {
+        4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"
+    }
+    return keycaps.get(i, f"{i}.")
 
 
 # --- Helpers (DB) ---
@@ -266,7 +316,6 @@ async def monthly_reset_internal():
     new_month = _current_month_key()
 
     async with db_lock:
-        # Snapshot top 3 per chat
         cursor.execute("SELECT DISTINCT chat_id FROM users")
         chat_ids = [row[0] for row in cursor.fetchall()]
 
@@ -287,16 +336,13 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, total_c, text_c, media_c))
 
-            # Reset monthly counters only (all-time stays)
             cursor.execute("""
                 UPDATE users
                 SET text_count = 0, media_count = 0, total_count = 0
                 WHERE chat_id = ?
             """, (chat_id,))
 
-        # Record that we are now in the new month
         _set_meta("last_reset_month", new_month)
-
         conn.commit()
 
 
@@ -328,17 +374,22 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
         return "No data yet! (Messages count after 24h.)"
 
     if show_all_time:
-        message = "🏆 Leaderboard (All-Time — Top 10)\n\n"
+        message = "🏆 Leaderboard — All-Time (Top 10)\n\n"
         for i, (username, all_text_c, all_media_c, all_total_c) in enumerate(rows, start=1):
-            message += f"{i}. {username}\n   📝 {all_text_c} | 🖼 {all_media_c} | 📊 {all_total_c}\n\n"
+            badge = rank_badge(i)
+            message += (
+                f"{badge} {username}\n"
+                f"   📝 {all_text_c}  •  🖼 {all_media_c}  •  📊 {all_total_c}\n\n"
+            )
         return message
 
-    message = "🏆 Leaderboard (This month — Top 10)\n\n"
+    message = "🏆 Leaderboard — This Month (Top 10)\n\n"
     for i, (username, text_c, media_c, total_c, all_text_c, all_media_c, all_total_c) in enumerate(rows, start=1):
+        badge = rank_badge(i)
         message += (
-            f"{i}. {username}\n"
-            f"   📅 Month → 📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n"
-            f"   🕰 All-Time → 📝 {all_text_c} | 🖼 {all_media_c} | 📊 {all_total_c}\n\n"
+            f"{badge} {username}\n"
+            f"   📅 Month: 📝 {text_c}  •  🖼 {media_c}  •  📊 {total_c}\n"
+            f"   🕰 All-time: 📝 {all_text_c}  •  🖼 {all_media_c}  •  📊 {all_total_c}\n\n"
         )
     return message
 
@@ -359,15 +410,15 @@ async def render_stats(chat_id: int, user_id: int) -> str:
     text_c, media_c, total_c, all_text_c, all_media_c, all_total_c = row
     return (
         "📊 Your Stats\n\n"
-        "📅 This Month:\n"
-        f"📝 Text: {text_c}\n"
-        f"🖼 Media: {media_c}\n"
-        f"📊 Total: {total_c}\n\n"
-        "🕰 All-Time:\n"
-        f"📝 Text: {all_text_c}\n"
-        f"🖼 Media: {all_media_c}\n"
-        f"📊 Total: {all_total_c}\n\n"
-        "⏳ Note: messages are awarded after 24 hours."
+        "📅 This Month\n"
+        f"• 📝 Text: {text_c}\n"
+        f"• 🖼 Media: {media_c}\n"
+        f"• 📊 Total: {total_c}\n\n"
+        "🕰 All-Time\n"
+        f"• 📝 Text: {all_text_c}\n"
+        f"• 🖼 Media: {all_media_c}\n"
+        f"• 📊 Total: {all_total_c}\n\n"
+        "⏳ Messages are awarded after 24 hours."
     )
 
 
@@ -385,34 +436,16 @@ async def render_hof(chat_id: int) -> str:
     if not rows:
         return "🏅 No Hall of Fame data yet (first snapshot happens on the 1st)."
 
-    out = "🏅 Hall of Fame (Top 3 each month)\n\n"
+    out = "🏅 Hall of Fame — Top 3 per Month\n\n"
     current_month = None
     for month, rank, username, total in rows:
         if month != current_month:
             current_month = month
             out += f"📅 {month}\n"
-        out += f"  {rank}. {username} — {total}\n"
+        out += f"  {rank_badge(rank)} {username} — {total}\n"
         if rank == 3:
             out += "\n"
     return out
-
-
-def help_text() -> str:
-    return (
-        "🤖 Available Commands\n\n"
-        "🏆 /leaderboard\n"
-        "   Show monthly leaderboard + all-time stats\n\n"
-        "🏆 /leaderboard all\n"
-        "   Show all-time leaderboard\n\n"
-        "📊 /stats\n"
-        "   View your monthly + all-time stats\n\n"
-        "🏅 /hof\n"
-        "   View Hall of Fame (Top 3 each month)\n\n"
-        "🛠 /forceaward\n"
-        "   (Admins only) Force award pending messages\n\n"
-        "📖 /help\n"
-        "   Show this command list\n"
-    )
 
 
 # --- Message Handler ---
@@ -482,13 +515,17 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_month_is_current()
 
     chat_id = update.effective_chat.id
-
     args = [a.lower() for a in (context.args or [])]
     show_all_time = len(args) >= 1 and args[0] in ("all", "alltime", "lifetime")
     view = "all" if show_all_time else "month"
 
     text = await render_leaderboard(chat_id, show_all_time)
-    msg = await context.bot.send_message(chat_id, text, reply_markup=leaderboard_keyboard(view))
+    msg = await context.bot.send_message(
+        chat_id,
+        text,
+        reply_markup=leaderboard_keyboard(view),
+        disable_web_page_preview=True,
+    )
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -500,7 +537,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     text = await render_stats(chat_id, user.id)
-    msg = await context.bot.send_message(chat_id, text, reply_markup=help_keyboard())
+    msg = await context.bot.send_message(
+        chat_id,
+        text,
+        reply_markup=secondary_keyboard(),
+        disable_web_page_preview=True,
+    )
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -510,7 +552,12 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = await render_hof(chat_id)
 
-    msg = await context.bot.send_message(chat_id, text, reply_markup=help_keyboard())
+    msg = await context.bot.send_message(
+        chat_id,
+        text,
+        reply_markup=secondary_keyboard(),
+        disable_web_page_preview=True,
+    )
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -544,8 +591,8 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_awarded = 0
     async with db_lock:
-        for chat_id, user_id, username, kind, n in rows:
-            _award_count(chat_id, user_id, username, kind, n)
+        for _chat_id, user_id, username, kind, n in rows:
+            _award_count(chat.id, user_id, username, kind, n)
             total_awarded += n
 
         cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
@@ -559,7 +606,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
     chat_id = update.effective_chat.id
-    msg = await context.bot.send_message(chat_id, help_text(), reply_markup=help_keyboard())
+    msg = await context.bot.send_message(
+        chat_id,
+        help_text(),
+        reply_markup=home_keyboard(),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -576,6 +629,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     try:
+        if data in ("nav:home", "nav:help"):
+            await query.edit_message_text(
+                help_text(),
+                reply_markup=home_keyboard(),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+
         if data == "lb:month":
             text = await render_leaderboard(chat_id, show_all_time=False)
             await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
@@ -589,33 +652,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "nav:stats":
-            user_id = query.from_user.id
-            text = await render_stats(chat_id, user_id)
-            await query.edit_message_text(text, reply_markup=help_keyboard())
+            text = await render_stats(chat_id, query.from_user.id)
+            await query.edit_message_text(text, reply_markup=secondary_keyboard())
             schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
         if data == "nav:hof":
             text = await render_hof(chat_id)
-            await query.edit_message_text(text, reply_markup=help_keyboard())
+            await query.edit_message_text(text, reply_markup=secondary_keyboard())
             schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
-        if data == "nav:help":
-            await query.edit_message_text(help_text(), reply_markup=help_keyboard())
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
-            return
     except Exception:
-        # If edit fails (message too old, not modified, etc.), ignore.
+        # edit can fail (message too old, deleted, etc.)
         pass
 
 
 # --- Monthly Reset Job (scheduled) ---
 async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Scheduled: 1st at 00:05 Montreal time.
-    Snapshot previous month, reset counters, update meta.
-    """
+    """Scheduled: 1st at 00:05 Montreal time."""
     await monthly_reset_internal()
 
 
@@ -657,7 +712,6 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))  # alias
 
-    # NEW: button callbacks
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Award matured messages every hour (counts messages once they are 24h old)
