@@ -15,6 +15,7 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TOKEN")
 TZ = ZoneInfo("America/Montreal")
+AUTO_DELETE_SECONDS = 30
 
 # --- Database Setup ---
 conn = sqlite3.connect("leaderboard.db", check_same_thread=False)
@@ -64,7 +65,52 @@ CREATE TABLE IF NOT EXISTS pending_messages (
 conn.commit()
 
 
-# --- Helper Functions ---
+# --- Helpers ---
+async def safe_delete_message(message):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def safe_delete_message_later(message, delay_seconds: int):
+    """Delete message after delay. Uses JobQueue so it works reliably."""
+    if not message:
+        return
+
+    async def _delete_cb(ctx: ContextTypes.DEFAULT_TYPE):
+        try:
+            await ctx.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
+        except Exception:
+            pass
+
+    try:
+        context_job_queue = message.get_bot()._application.job_queue  # fallback path (rare)
+        # Prefer scheduling on the application's job queue via context in handlers below
+    except Exception:
+        context_job_queue = None
+
+    # We will schedule deletion from handlers using context.job_queue (preferred).
+    # This function exists for compatibility; we won't call it directly without context.
+
+
+def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_seconds: int):
+    """Schedule deletion using PTB JobQueue."""
+    async def _delete_cb(ctx: ContextTypes.DEFAULT_TYPE):
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    try:
+        context.job_queue.run_once(_delete_cb, when=delay_seconds)
+    except Exception:
+        # If JobQueue is unavailable or scheduling fails, just ignore.
+        pass
+
+
 def ensure_user_row(chat_id: int, user_id: int, username: str):
     cursor.execute(
         "SELECT 1 FROM users WHERE chat_id = ? AND user_id = ?",
@@ -158,6 +204,9 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Commands ---
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Delete the command message
+    await safe_delete_message(update.message)
+
     chat_id = update.effective_chat.id
 
     cursor.execute("""
@@ -170,17 +219,21 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("No data yet! (Messages count after 24h.)")
+        msg = await context.bot.send_message(chat_id, "No data yet! (Messages count after 24h.)")
+        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
     message = "🏆 Leaderboard (This month — Top 10)\n\n"
     for i, (username, text_c, media_c, total_c) in enumerate(rows, start=1):
         message += f"{i}. {username}\n   📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n\n"
 
-    await update.message.reply_text(message)
+    msg = await context.bot.send_message(chat_id, message)
+    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
     chat_id = update.effective_chat.id
     user = update.effective_user
 
@@ -192,20 +245,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = cursor.fetchone()
 
     if not row:
-        await update.message.reply_text("You have no stats yet! (Messages count after 24h.)")
+        msg = await context.bot.send_message(chat_id, "You have no stats yet! (Messages count after 24h.)")
+        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
     text_c, media_c, total_c = row
-    await update.message.reply_text(
+    msg = await context.bot.send_message(
+        chat_id,
         f"📊 Your Stats (This month)\n\n"
         f"📝 Text: {text_c}\n"
         f"🖼 Media: {media_c}\n"
         f"📊 Total: {total_c}\n\n"
         f"⏳ Note: messages are awarded after 24 hours."
     )
+    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
     chat_id = update.effective_chat.id
 
     cursor.execute("""
@@ -218,7 +276,8 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("🏅 No Hall of Fame data yet (first snapshot happens on the 1st).")
+        msg = await context.bot.send_message(chat_id, "🏅 No Hall of Fame data yet (first snapshot happens on the 1st).")
+        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
     out = "🏅 Hall of Fame (Top 3 each month)\n\n"
@@ -231,17 +290,20 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rank == 3:
             out += "\n"
 
-    await update.message.reply_text(out)
+    msg = await context.bot.send_message(chat_id, out)
+    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: immediately award ALL pending messages in this chat."""
+    await safe_delete_message(update.message)
+
     chat = update.effective_chat
     user = update.effective_user
 
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
-        await update.message.reply_text("❌ Admins only.")
+        msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
     cursor.execute("""
@@ -253,7 +315,8 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("No pending messages to award.")
+        msg = await context.bot.send_message(chat.id, "No pending messages to award.")
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
     total_awarded = 0
@@ -264,9 +327,8 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
     conn.commit()
 
-    await update.message.reply_text(
-        f"✅ Admin override complete.\n\nAwarded {total_awarded} pending messages immediately."
-    )
+    msg = await context.bot.send_message(chat.id, f"✅ Awarded {total_awarded} pending messages.")
+    schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 # --- Monthly Reset Job ---
