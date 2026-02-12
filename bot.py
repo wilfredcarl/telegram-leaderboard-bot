@@ -14,7 +14,7 @@ from telegram.ext import (
 
 # ✅ Recommended: set TOKEN as an environment variable in Railway
 # Railway: Variables -> add TOKEN = your_token
-TOKEN = os.getenv("TOKEN", "8590522532:AAES85F2lQfkJgO243HYRV56vEiNQMC0X8w
+TOKEN = os.getenv("8590522532:AAES85F2lQfkJgO243HYRV56vEiNQMC0X8w", "8590522532:AAES85F2lQfkJgO243HYRV56vEiNQMC0X8w
 ")
 
 TZ = ZoneInfo("America/Montreal")
