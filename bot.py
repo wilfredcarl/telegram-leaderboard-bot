@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time as time_mod
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -12,10 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-# ✅ Recommended: set TOKEN as an environment variable in Railway
-# Railway: Variables -> add TOKEN = your_token
 TOKEN = os.getenv("TOKEN")
-
 TZ = ZoneInfo("America/Montreal")
 
 # --- Database Setup ---
@@ -50,44 +48,54 @@ CREATE TABLE IF NOT EXISTS hall_of_fame (
 )
 """)
 
+# Pending messages to be awarded after 24h
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS pending_messages (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    kind TEXT NOT NULL,              -- 'text' or 'media'
+    created_at_utc INTEGER NOT NULL, -- unix timestamp
+    PRIMARY KEY (chat_id, message_id)
+)
+""")
+
 conn.commit()
 
 
 # --- Helper Functions ---
-def update_user(chat_id: int, user, is_media: bool):
-    username = user.username or user.first_name or "Unknown"
-
+def ensure_user_row(chat_id: int, user_id: int, username: str):
     cursor.execute(
         "SELECT 1 FROM users WHERE chat_id = ? AND user_id = ?",
-        (chat_id, user.id)
+        (chat_id, user_id)
     )
-    exists = cursor.fetchone()
-
-    if not exists:
+    if not cursor.fetchone():
         cursor.execute("""
             INSERT INTO users (chat_id, user_id, username, text_count, media_count, total_count)
             VALUES (?, ?, ?, 0, 0, 0)
-        """, (chat_id, user.id, username))
-        conn.commit()
+        """, (chat_id, user_id, username))
 
-    if is_media:
+
+def award_count(chat_id: int, user_id: int, username: str, kind: str, n: int):
+    ensure_user_row(chat_id, user_id, username)
+
+    if kind == "media":
         cursor.execute("""
             UPDATE users
-            SET media_count = media_count + 1,
-                total_count = total_count + 1,
+            SET media_count = media_count + ?,
+                total_count = total_count + ?,
                 username = ?
             WHERE chat_id = ? AND user_id = ?
-        """, (username, chat_id, user.id))
+        """, (n, n, username, chat_id, user_id))
     else:
         cursor.execute("""
             UPDATE users
-            SET text_count = text_count + 1,
-                total_count = total_count + 1,
+            SET text_count = text_count + ?,
+                total_count = total_count + ?,
                 username = ?
             WHERE chat_id = ? AND user_id = ?
-        """, (username, chat_id, user.id))
-
-    conn.commit()
+        """, (n, n, username, chat_id, user_id))
 
 
 # --- Message Handler ---
@@ -95,19 +103,59 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    msg = update.message
+
+    # ✅ Ignore stickers entirely
+    if msg.sticker:
+        return
+
     chat_id = update.effective_chat.id
-    user = update.message.from_user
+    user = msg.from_user
+    username = user.username or user.first_name or "Unknown"
 
     is_media = bool(
-        update.message.photo
-        or update.message.video
-        or update.message.document
-        or update.message.animation
-        or update.message.voice
-        or update.message.sticker
+        msg.photo
+        or msg.video
+        or msg.document
+        or msg.animation
+        or msg.voice
     )
 
-    update_user(chat_id, user, is_media)
+    kind = "media" if is_media else "text"
+    created_at_utc = int(time_mod.time())
+
+    # Store as pending and award after 24 hours
+    cursor.execute("""
+        INSERT OR IGNORE INTO pending_messages
+        (chat_id, message_id, user_id, username, kind, created_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
+    conn.commit()
+
+
+# --- Job: award matured pending messages (>= 24h old) ---
+async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
+    now = int(time_mod.time())
+    cutoff = now - 24 * 60 * 60  # 24 hours
+
+    # Group matured messages by user/kind to update efficiently
+    cursor.execute("""
+        SELECT chat_id, user_id, username, kind, COUNT(*)
+        FROM pending_messages
+        WHERE created_at_utc <= ?
+        GROUP BY chat_id, user_id, username, kind
+    """, (cutoff,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        return
+
+    for chat_id, user_id, username, kind, n in rows:
+        award_count(chat_id, user_id, username, kind, n)
+
+    # Remove matured messages from pending table
+    cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
+    conn.commit()
 
 
 # --- Commands ---
@@ -124,15 +172,12 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("No data yet!")
+        await update.message.reply_text("No data yet! (Remember: messages count after 24h.)")
         return
 
     message = "🏆 Leaderboard (This month — Top 10)\n\n"
     for i, (username, text_c, media_c, total_c) in enumerate(rows, start=1):
-        message += (
-            f"{i}. {username}\n"
-            f"   📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n\n"
-        )
+        message += f"{i}. {username}\n   📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n\n"
 
     await update.message.reply_text(message)
 
@@ -149,7 +194,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = cursor.fetchone()
 
     if not row:
-        await update.message.reply_text("You have no stats yet!")
+        await update.message.reply_text("You have no stats yet! (Messages count after 24h.)")
         return
 
     text_c, media_c, total_c = row
@@ -157,12 +202,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Your Stats (This month)\n\n"
         f"📝 Text: {text_c}\n"
         f"🖼 Media: {media_c}\n"
-        f"📊 Total: {total_c}"
+        f"📊 Total: {total_c}\n\n"
+        f"⏳ Note: messages are awarded after 24 hours."
     )
 
 
 async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows saved Top 3 for recent months for this chat."""
     chat_id = update.effective_chat.id
 
     cursor.execute("""
@@ -197,12 +242,10 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ)
     month_key = now.strftime("%Y-%m")
 
-    # Find all chats we have records for
     cursor.execute("SELECT DISTINCT chat_id FROM users")
     chat_ids = [row[0] for row in cursor.fetchall()]
 
     for chat_id in chat_ids:
-        # Top 3 for this chat
         cursor.execute("""
             SELECT user_id, username, text_count, media_count, total_count
             FROM users
@@ -212,7 +255,6 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
         """, (chat_id,))
         top3 = cursor.fetchall()
 
-        # Save snapshot
         for idx, (user_id, username, text_c, media_c, total_c) in enumerate(top3, start=1):
             cursor.execute("""
                 INSERT OR REPLACE INTO hall_of_fame
@@ -220,7 +262,6 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (chat_id, month_key, idx, user_id, username, total_c, text_c, media_c))
 
-        # Reset counters
         cursor.execute("""
             UPDATE users
             SET text_count = 0, media_count = 0, total_count = 0
@@ -239,7 +280,10 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
 
-    # Run on the 1st at 00:05 Montreal time
+    # Award matured messages every hour (counts messages once they are 24h old)
+    app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
+
+    # Monthly reset: 1st at 00:05 Montreal time
     app.job_queue.run_monthly(
         monthly_reset,
         when=time(hour=0, minute=5, tzinfo=TZ),
