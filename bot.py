@@ -138,7 +138,6 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
     now = int(time_mod.time())
     cutoff = now - 24 * 60 * 60  # 24 hours
 
-    # Group matured messages by user/kind to update efficiently
     cursor.execute("""
         SELECT chat_id, user_id, username, kind, COUNT(*)
         FROM pending_messages
@@ -153,7 +152,6 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
     for chat_id, user_id, username, kind, n in rows:
         award_count(chat_id, user_id, username, kind, n)
 
-    # Remove matured messages from pending table
     cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
     conn.commit()
 
@@ -172,7 +170,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("No data yet! (Remember: messages count after 24h.)")
+        await update.message.reply_text("No data yet! (Messages count after 24h.)")
         return
 
     message = "🏆 Leaderboard (This month — Top 10)\n\n"
@@ -184,7 +182,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = update.message.from_user
+    user = update.effective_user
 
     cursor.execute("""
         SELECT text_count, media_count, total_count
@@ -236,6 +234,41 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(out)
 
 
+async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: immediately award ALL pending messages in this chat."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    cursor.execute("""
+        SELECT chat_id, user_id, username, kind, COUNT(*)
+        FROM pending_messages
+        WHERE chat_id = ?
+        GROUP BY chat_id, user_id, username, kind
+    """, (chat.id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No pending messages to award.")
+        return
+
+    total_awarded = 0
+    for chat_id, user_id, username, kind, n in rows:
+        award_count(chat_id, user_id, username, kind, n)
+        total_awarded += n
+
+    cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
+    conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Admin override complete.\n\nAwarded {total_awarded} pending messages immediately."
+    )
+
+
 # --- Monthly Reset Job ---
 async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     """On the 1st, snapshot Top 3 for each chat, then reset monthly counters."""
@@ -279,6 +312,7 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
+    app.add_handler(CommandHandler("forceaward", forceaward))
 
     # Award matured messages every hour (counts messages once they are 24h old)
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
