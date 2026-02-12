@@ -142,6 +142,53 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
+async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *,
+                       parse_mode: str | None = None, reply_markup=None):
+    """
+    DM-only behavior:
+    - If command is used in a group, bot DMs the user (private).
+      Optionally posts a short notice in group (auto-deleted).
+    - If DM fails (user hasn't started bot), post instructions in group (auto-deleted).
+    - If used in private chat, just send there.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    # If already in private chat, just send and auto-delete (optional)
+    if chat.type == "private":
+        msg = await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
+        return
+
+    # In groups: try DM
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+        notice = await context.bot.send_message(chat_id=chat.id, text="📩 Sent you a DM.")
+        schedule_delete(context, chat.id, notice.message_id, AUTO_DELETE_SECONDS)
+
+    except Exception:
+        notice = await context.bot.send_message(
+            chat_id=chat.id,
+            text="❗ I couldn't DM you. Please open my bot in private and press Start, then try again.",
+        )
+        schedule_delete(context, chat.id, notice.message_id, AUTO_DELETE_SECONDS)
+
+
 # --- Professional UI Keyboards ---
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -160,7 +207,6 @@ def home_keyboard() -> InlineKeyboardMarkup:
 
 
 def leaderboard_keyboard(view: str) -> InlineKeyboardMarkup:
-    # view: "month" or "all"
     if view == "all":
         switch = InlineKeyboardButton("🏆 View Monthly", callback_data="lb:month")
     else:
@@ -204,8 +250,6 @@ def help_text() -> str:
 
 
 # --- Rank badges (medals + “animated-friendly” emojis) ---
-# Note: Telegram's “animated emoji” effect depends on client and context.
-# Using 🥇🥈🥉 gives the classic medal look; many clients animate these when sent.
 def rank_badge(i: int) -> str:
     if i == 1:
         return "🥇"
@@ -286,12 +330,6 @@ def _previous_month_key() -> str:
 
 
 async def ensure_month_is_current():
-    """
-    If the bot was down during the 1st 00:05 schedule, we still want:
-    - snapshot top 3 for the month that ended
-    - reset monthly counters
-    This runs on startup + periodically (e.g., hourly award job).
-    """
     current_month = _current_month_key()
 
     async with db_lock:
@@ -306,12 +344,10 @@ async def ensure_month_is_current():
         if last_reset_month == current_month:
             return
 
-    # Month rolled over; perform reset once
     await monthly_reset_internal()
 
 
 async def monthly_reset_internal():
-    """DB-only monthly reset (safe to call from ensure_month_is_current)."""
     honor_month = _previous_month_key()
     new_month = _current_month_key()
 
@@ -509,7 +545,7 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
 
 
-# --- Commands ---
+# --- Commands (DM ONLY) ---
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
     await ensure_month_is_current()
@@ -520,13 +556,12 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     view = "all" if show_all_time else "month"
 
     text = await render_leaderboard(chat_id, show_all_time)
-    msg = await context.bot.send_message(
-        chat_id,
+    await send_dm_only(
+        update,
+        context,
         text,
         reply_markup=leaderboard_keyboard(view),
-        disable_web_page_preview=True,
     )
-    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,13 +572,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     text = await render_stats(chat_id, user.id)
-    msg = await context.bot.send_message(
-        chat_id,
+    await send_dm_only(
+        update,
+        context,
         text,
         reply_markup=secondary_keyboard(),
-        disable_web_page_preview=True,
     )
-    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,16 +586,16 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = await render_hof(chat_id)
 
-    msg = await context.bot.send_message(
-        chat_id,
+    await send_dm_only(
+        update,
+        context,
         text,
         reply_markup=secondary_keyboard(),
-        disable_web_page_preview=True,
     )
-    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Admin command: keep in group (admins typically need visible feedback)
     await safe_delete_message(update.message)
 
     chat = update.effective_chat
@@ -605,18 +639,16 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
-    chat_id = update.effective_chat.id
-    msg = await context.bot.send_message(
-        chat_id,
+    await send_dm_only(
+        update,
+        context,
         help_text(),
-        reply_markup=home_keyboard(),
         parse_mode="Markdown",
-        disable_web_page_preview=True,
+        reply_markup=home_keyboard(),
     )
-    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
-# --- Button Callback Handler ---
+# --- Button Callback Handler (DM only menus live in DM) ---
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not query.message:
@@ -628,6 +660,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     data = query.data or ""
 
+    # If someone somehow triggers callbacks in a group, force DM-only UX:
+    if query.message.chat.type != "private":
+        try:
+            warn = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
+            schedule_delete(context, query.message.chat_id, warn.message_id, AUTO_DELETE_SECONDS)
+        except Exception:
+            pass
+        return
+
     try:
         if data in ("nav:home", "nav:help"):
             await query.edit_message_text(
@@ -636,35 +677,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
         if data == "lb:month":
             text = await render_leaderboard(chat_id, show_all_time=False)
             await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
         if data == "lb:all":
             text = await render_leaderboard(chat_id, show_all_time=True)
             await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"))
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
         if data == "nav:stats":
             text = await render_stats(chat_id, query.from_user.id)
             await query.edit_message_text(text, reply_markup=secondary_keyboard())
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
         if data == "nav:hof":
             text = await render_hof(chat_id)
             await query.edit_message_text(text, reply_markup=secondary_keyboard())
-            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
             return
 
     except Exception:
-        # edit can fail (message too old, deleted, etc.)
         pass
 
 
@@ -678,14 +713,13 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     await ensure_month_is_current()
 
-    # Optional: set the Telegram command menu (shows in the UI)
     try:
         await app.bot.set_my_commands([
-            BotCommand("leaderboard", "Show monthly leaderboard (add 'all' for all-time)"),
-            BotCommand("stats", "View your stats"),
-            BotCommand("hof", "Hall of Fame"),
+            BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
+            BotCommand("stats", "DM: your stats"),
+            BotCommand("hof", "DM: hall of fame"),
             BotCommand("forceaward", "Admin: award pending messages"),
-            BotCommand("help", "Show all commands"),
+            BotCommand("help", "DM: show commands"),
         ])
     except Exception:
         pass
@@ -705,13 +739,17 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages))
 
+    # DM-only user commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
-    app.add_handler(CommandHandler("forceaward", forceaward))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))  # alias
 
+    # Admin command (group feedback)
+    app.add_handler(CommandHandler("forceaward", forceaward))
+
+    # Button callbacks (live in DM)
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Award matured messages every hour (counts messages once they are 24h old)
