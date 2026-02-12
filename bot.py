@@ -5,12 +5,18 @@ import asyncio
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import (
+    Update,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     MessageHandler,
     CommandHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -24,15 +30,23 @@ DB_PATH = "leaderboard.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
-# Per-chat per-user monthly counters
+# Per-chat per-user monthly + all-time counters
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     username TEXT,
+
+    -- monthly (reset each month)
     text_count INTEGER DEFAULT 0,
     media_count INTEGER DEFAULT 0,
     total_count INTEGER DEFAULT 0,
+
+    -- all-time (never reset)
+    all_text_count INTEGER DEFAULT 0,
+    all_media_count INTEGER DEFAULT 0,
+    all_total_count INTEGER DEFAULT 0,
+
     PRIMARY KEY (chat_id, user_id)
 )
 """)
@@ -79,6 +93,31 @@ conn.commit()
 db_lock = asyncio.Lock()
 
 
+def ensure_all_time_columns():
+    """
+    For existing databases: add all-time columns if missing.
+    Safe to call on every startup.
+    """
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    needed = {
+        "all_text_count": "ALTER TABLE users ADD COLUMN all_text_count INTEGER DEFAULT 0",
+        "all_media_count": "ALTER TABLE users ADD COLUMN all_media_count INTEGER DEFAULT 0",
+        "all_total_count": "ALTER TABLE users ADD COLUMN all_total_count INTEGER DEFAULT 0",
+    }
+
+    for col, stmt in needed.items():
+        if col not in columns:
+            cursor.execute(stmt)
+
+    conn.commit()
+
+
+# Ensure schema is up-to-date (important if DB already existed)
+ensure_all_time_columns()
+
+
 # --- Helpers (Telegram) ---
 async def safe_delete_message(message):
     if not message:
@@ -103,6 +142,33 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
+# --- Inline Keyboards ---
+def leaderboard_keyboard(view: str) -> InlineKeyboardMarkup:
+    # view: "month" or "all"
+    if view == "all":
+        buttons = [
+            [InlineKeyboardButton("📅 This Month", callback_data="lb:month")],
+            [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
+            [InlineKeyboardButton("📖 Help", callback_data="nav:help")],
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton("🕰 All-Time", callback_data="lb:all")],
+            [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
+            [InlineKeyboardButton("📖 Help", callback_data="nav:help")],
+        ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏆 Leaderboard (Month)", callback_data="lb:month")],
+        [InlineKeyboardButton("🕰 Leaderboard (All-Time)", callback_data="lb:all")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="nav:stats")],
+        [InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof")],
+    ])
+
+
 # --- Helpers (DB) ---
 def _ensure_user_row(chat_id: int, user_id: int, username: str):
     cursor.execute(
@@ -111,8 +177,12 @@ def _ensure_user_row(chat_id: int, user_id: int, username: str):
     )
     if not cursor.fetchone():
         cursor.execute("""
-            INSERT INTO users (chat_id, user_id, username, text_count, media_count, total_count)
-            VALUES (?, ?, ?, 0, 0, 0)
+            INSERT INTO users (
+                chat_id, user_id, username,
+                text_count, media_count, total_count,
+                all_text_count, all_media_count, all_total_count
+            )
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
         """, (chat_id, user_id, username))
 
 
@@ -124,17 +194,21 @@ def _award_count(chat_id: int, user_id: int, username: str, kind: str, n: int):
             UPDATE users
             SET media_count = media_count + ?,
                 total_count = total_count + ?,
+                all_media_count = all_media_count + ?,
+                all_total_count = all_total_count + ?,
                 username = ?
             WHERE chat_id = ? AND user_id = ?
-        """, (n, n, username, chat_id, user_id))
+        """, (n, n, n, n, username, chat_id, user_id))
     else:
         cursor.execute("""
             UPDATE users
             SET text_count = text_count + ?,
                 total_count = total_count + ?,
+                all_text_count = all_text_count + ?,
+                all_total_count = all_total_count + ?,
                 username = ?
             WHERE chat_id = ? AND user_id = ?
-        """, (n, n, username, chat_id, user_id))
+        """, (n, n, n, n, username, chat_id, user_id))
 
 
 def _get_meta(key: str) -> str | None:
@@ -182,9 +256,7 @@ async def ensure_month_is_current():
         if last_reset_month == current_month:
             return
 
-    # Month rolled over; perform reset once (outside lock -> call the reset which locks)
-    # Using the normal monthly_reset() ensures snapshot month is correct.
-    # We pass a dummy context via None by using the internal DB work below.
+    # Month rolled over; perform reset once
     await monthly_reset_internal()
 
 
@@ -215,7 +287,7 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, total_c, text_c, media_c))
 
-            # Reset counters for the new month
+            # Reset monthly counters only (all-time stays)
             cursor.execute("""
                 UPDATE users
                 SET text_count = 0, media_count = 0, total_count = 0
@@ -226,6 +298,121 @@ async def monthly_reset_internal():
         _set_meta("last_reset_month", new_month)
 
         conn.commit()
+
+
+# --- Rendering helpers (reuse for buttons + commands) ---
+async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
+    async with db_lock:
+        if show_all_time:
+            cursor.execute("""
+                SELECT username, all_text_count, all_media_count, all_total_count
+                FROM users
+                WHERE chat_id = ?
+                ORDER BY all_total_count DESC
+                LIMIT 10
+            """, (chat_id,))
+            rows = cursor.fetchall()
+        else:
+            cursor.execute("""
+                SELECT username,
+                       text_count, media_count, total_count,
+                       all_text_count, all_media_count, all_total_count
+                FROM users
+                WHERE chat_id = ?
+                ORDER BY total_count DESC
+                LIMIT 10
+            """, (chat_id,))
+            rows = cursor.fetchall()
+
+    if not rows:
+        return "No data yet! (Messages count after 24h.)"
+
+    if show_all_time:
+        message = "🏆 Leaderboard (All-Time — Top 10)\n\n"
+        for i, (username, all_text_c, all_media_c, all_total_c) in enumerate(rows, start=1):
+            message += f"{i}. {username}\n   📝 {all_text_c} | 🖼 {all_media_c} | 📊 {all_total_c}\n\n"
+        return message
+
+    message = "🏆 Leaderboard (This month — Top 10)\n\n"
+    for i, (username, text_c, media_c, total_c, all_text_c, all_media_c, all_total_c) in enumerate(rows, start=1):
+        message += (
+            f"{i}. {username}\n"
+            f"   📅 Month → 📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n"
+            f"   🕰 All-Time → 📝 {all_text_c} | 🖼 {all_media_c} | 📊 {all_total_c}\n\n"
+        )
+    return message
+
+
+async def render_stats(chat_id: int, user_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT text_count, media_count, total_count,
+                   all_text_count, all_media_count, all_total_count
+            FROM users
+            WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, user_id))
+        row = cursor.fetchone()
+
+    if not row:
+        return "You have no stats yet! (Messages count after 24h.)"
+
+    text_c, media_c, total_c, all_text_c, all_media_c, all_total_c = row
+    return (
+        "📊 Your Stats\n\n"
+        "📅 This Month:\n"
+        f"📝 Text: {text_c}\n"
+        f"🖼 Media: {media_c}\n"
+        f"📊 Total: {total_c}\n\n"
+        "🕰 All-Time:\n"
+        f"📝 Text: {all_text_c}\n"
+        f"🖼 Media: {all_media_c}\n"
+        f"📊 Total: {all_total_c}\n\n"
+        "⏳ Note: messages are awarded after 24 hours."
+    )
+
+
+async def render_hof(chat_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT month, rank, username, total_count
+            FROM hall_of_fame
+            WHERE chat_id = ?
+            ORDER BY month DESC, rank ASC
+            LIMIT 36
+        """, (chat_id,))
+        rows = cursor.fetchall()
+
+    if not rows:
+        return "🏅 No Hall of Fame data yet (first snapshot happens on the 1st)."
+
+    out = "🏅 Hall of Fame (Top 3 each month)\n\n"
+    current_month = None
+    for month, rank, username, total in rows:
+        if month != current_month:
+            current_month = month
+            out += f"📅 {month}\n"
+        out += f"  {rank}. {username} — {total}\n"
+        if rank == 3:
+            out += "\n"
+    return out
+
+
+def help_text() -> str:
+    return (
+        "🤖 Available Commands\n\n"
+        "🏆 /leaderboard\n"
+        "   Show monthly leaderboard + all-time stats\n\n"
+        "🏆 /leaderboard all\n"
+        "   Show all-time leaderboard\n\n"
+        "📊 /stats\n"
+        "   View your monthly + all-time stats\n\n"
+        "🏅 /hof\n"
+        "   View Hall of Fame (Top 3 each month)\n\n"
+        "🛠 /forceaward\n"
+        "   (Admins only) Force award pending messages\n\n"
+        "📖 /help\n"
+        "   Show this command list\n"
+    )
 
 
 # --- Message Handler ---
@@ -265,7 +452,6 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Job: award matured pending messages (>= 24h old) ---
 async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
-    # Ensure month rollover is handled even if scheduled reset was missed
     await ensure_month_is_current()
 
     now = int(time_mod.time())
@@ -297,26 +483,12 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    async with db_lock:
-        cursor.execute("""
-            SELECT username, text_count, media_count, total_count
-            FROM users
-            WHERE chat_id = ?
-            ORDER BY total_count DESC
-            LIMIT 10
-        """, (chat_id,))
-        rows = cursor.fetchall()
+    args = [a.lower() for a in (context.args or [])]
+    show_all_time = len(args) >= 1 and args[0] in ("all", "alltime", "lifetime")
+    view = "all" if show_all_time else "month"
 
-    if not rows:
-        msg = await context.bot.send_message(chat_id, "No data yet! (Messages count after 24h.)")
-        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
-        return
-
-    message = "🏆 Leaderboard (This month — Top 10)\n\n"
-    for i, (username, text_c, media_c, total_c) in enumerate(rows, start=1):
-        message += f"{i}. {username}\n   📝 {text_c} | 🖼 {media_c} | 📊 {total_c}\n\n"
-
-    msg = await context.bot.send_message(chat_id, message)
+    text = await render_leaderboard(chat_id, show_all_time)
+    msg = await context.bot.send_message(chat_id, text, reply_markup=leaderboard_keyboard(view))
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -327,28 +499,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
 
-    async with db_lock:
-        cursor.execute("""
-            SELECT text_count, media_count, total_count
-            FROM users
-            WHERE chat_id = ? AND user_id = ?
-        """, (chat_id, user.id))
-        row = cursor.fetchone()
-
-    if not row:
-        msg = await context.bot.send_message(chat_id, "You have no stats yet! (Messages count after 24h.)")
-        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
-        return
-
-    text_c, media_c, total_c = row
-    msg = await context.bot.send_message(
-        chat_id,
-        f"📊 Your Stats (This month)\n\n"
-        f"📝 Text: {text_c}\n"
-        f"🖼 Media: {media_c}\n"
-        f"📊 Total: {total_c}\n\n"
-        f"⏳ Note: messages are awarded after 24 hours."
-    )
+    text = await render_stats(chat_id, user.id)
+    msg = await context.bot.send_message(chat_id, text, reply_markup=help_keyboard())
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -356,33 +508,9 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
     chat_id = update.effective_chat.id
+    text = await render_hof(chat_id)
 
-    async with db_lock:
-        cursor.execute("""
-            SELECT month, rank, username, total_count
-            FROM hall_of_fame
-            WHERE chat_id = ?
-            ORDER BY month DESC, rank ASC
-            LIMIT 36
-        """, (chat_id,))
-        rows = cursor.fetchall()
-
-    if not rows:
-        msg = await context.bot.send_message(chat_id, "🏅 No Hall of Fame data yet (first snapshot happens on the 1st).")
-        schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
-        return
-
-    out = "🏅 Hall of Fame (Top 3 each month)\n\n"
-    current_month = None
-    for month, rank, username, total in rows:
-        if month != current_month:
-            current_month = month
-            out += f"📅 {month}\n"
-        out += f"  {rank}. {username} — {total}\n"
-        if rank == 3:
-            out += "\n"
-
-    msg = await context.bot.send_message(chat_id, out)
+    msg = await context.bot.send_message(chat_id, text, reply_markup=help_keyboard())
     schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
@@ -409,10 +537,6 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (chat.id,))
         rows = cursor.fetchall()
 
-        if not rows:
-            # outside lock for send is fine, but keep it simple:
-            pass
-
     if not rows:
         msg = await context.bot.send_message(chat.id, "No pending messages to award.")
         schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
@@ -431,6 +555,61 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
+    chat_id = update.effective_chat.id
+    msg = await context.bot.send_message(chat_id, help_text(), reply_markup=help_keyboard())
+    schedule_delete(context, chat_id, msg.message_id, AUTO_DELETE_SECONDS)
+
+
+# --- Button Callback Handler ---
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+    await ensure_month_is_current()
+
+    chat_id = query.message.chat_id
+    data = query.data or ""
+
+    try:
+        if data == "lb:month":
+            text = await render_leaderboard(chat_id, show_all_time=False)
+            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+
+        if data == "lb:all":
+            text = await render_leaderboard(chat_id, show_all_time=True)
+            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"))
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+
+        if data == "nav:stats":
+            user_id = query.from_user.id
+            text = await render_stats(chat_id, user_id)
+            await query.edit_message_text(text, reply_markup=help_keyboard())
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+
+        if data == "nav:hof":
+            text = await render_hof(chat_id)
+            await query.edit_message_text(text, reply_markup=help_keyboard())
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+
+        if data == "nav:help":
+            await query.edit_message_text(help_text(), reply_markup=help_keyboard())
+            schedule_delete(context, chat_id, query.message.message_id, AUTO_DELETE_SECONDS)
+            return
+    except Exception:
+        # If edit fails (message too old, not modified, etc.), ignore.
+        pass
+
+
 # --- Monthly Reset Job (scheduled) ---
 async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -442,8 +621,19 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
 
 # --- App lifecycle ---
 async def post_init(app):
-    # Catch up if the bot starts after a month boundary
     await ensure_month_is_current()
+
+    # Optional: set the Telegram command menu (shows in the UI)
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("leaderboard", "Show monthly leaderboard (add 'all' for all-time)"),
+            BotCommand("stats", "View your stats"),
+            BotCommand("hof", "Hall of Fame"),
+            BotCommand("forceaward", "Admin: award pending messages"),
+            BotCommand("help", "Show all commands"),
+        ])
+    except Exception:
+        pass
 
 
 # --- Main ---
@@ -459,10 +649,16 @@ def main():
     )
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages))
+
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
     app.add_handler(CommandHandler("forceaward", forceaward))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("commands", help_command))  # alias
+
+    # NEW: button callbacks
+    app.add_handler(CallbackQueryHandler(on_button))
 
     # Award matured messages every hour (counts messages once they are 24h old)
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
