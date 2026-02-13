@@ -17,7 +17,7 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
-    MessageReactionHandler,   # ✅ NEW (PTB 22.x)
+    MessageReactionHandler,
     filters,
 )
 
@@ -395,9 +395,10 @@ def _ensure_user_row(chat_id: int, user_id: int, username: str):
             INSERT INTO users (
                 chat_id, user_id, username,
                 text_count, media_count, total_count,
-                all_text_count, all_media_count, all_total_count
+                all_text_count, all_media_count, all_total_count,
+                react_count, all_react_count
             )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
         """, (chat_id, user_id, username))
 
 def _award_count(chat_id: int, user_id: int, username: str, kind: str, n: int):
@@ -486,7 +487,17 @@ async def monthly_reset_internal():
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
 
+def _fmt_name(username: str, width: int = 16) -> str:
+    name = (username or "Unknown").replace("\n", " ").strip()
+    if len(name) > width:
+        return name[: width - 1] + "…"
+    return name.ljust(width)
+
 async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
+    """
+    Returns Markdown (monospace table).
+    ✅ Monthly view shows ONLY monthly stats (no all-time line).
+    """
     async with db_lock:
         if show_all_time:
             cursor.execute("""
@@ -499,8 +510,7 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             rows = cursor.fetchall()
         else:
             cursor.execute("""
-                SELECT username, text_count, media_count, total_count, react_count,
-                       all_text_count, all_media_count, all_total_count, all_react_count
+                SELECT username, text_count, media_count, total_count, react_count
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY total_count DESC
@@ -511,25 +521,30 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
     if not rows:
         return "No data yet! (Messages count after 24h.)"
 
-    if show_all_time:
-        out = "🏆 Leaderboard — All-Time (Top 10)\n\n"
-        for i, (username, t, m, total, r) in enumerate(rows, start=1):
-            out += f"{rank_badge(i)} {username}\n   📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n\n"
-        return out
+    title = "🏆 Leaderboard — All-Time (Top 10)" if show_all_time else "🏆 Leaderboard — This Month (Top 10)"
 
-    out = "🏆 Leaderboard — This Month (Top 10)\n\n"
-    for i, (username, t, m, total, r, at, am, a_total, ar) in enumerate(rows, start=1):
-        out += (
-            f"{rank_badge(i)} {username}\n"
-            f"   📅 Month: 📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n"
-            f"   🕰 All-time: 📝 {at}  •  🖼 {am}  •  📊 {a_total}  •  ❤️ {ar}\n\n"
-        )
-    return out
+    # Monospace table
+    lines = []
+    lines.append("```text")
+    lines.append(f"{'#':<2} {'User':<16} {'T':>4} {'M':>4} {'Tot':>5} {'❤️':>4}")
+    lines.append("-" * 37)
+
+    for i, (username, t, m, total, r) in enumerate(rows, start=1):
+        rank_col = f"{i:>2}"
+        name_col = _fmt_name(username, 16)
+        lines.append(f"{rank_col} {name_col} {t:>4} {m:>4} {total:>5} {r:>4}")
+
+    lines.append("```")
+
+    return f"{title}\n" + "\n".join(lines)
 
 async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """
     Creates one permanent leaderboard message (and pins it if allowed),
     then keeps editing that same message on updates.
+
+    ✅ Matches Monthly button
+    ✅ Uses Markdown table formatting
     """
     await ensure_month_is_current()
     text = await render_leaderboard(chat_id, show_all_time=False)
@@ -541,14 +556,25 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     # Try edit existing
     if stored:
         try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=int(stored), text=text)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(stored),
+                text=text,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
             return
         except Exception as e:
             print("edit_group_leaderboard failed (will recreate):", repr(e))
 
     # Create new message
     try:
-        msg = await context.bot.send_message(chat_id=chat_id, text=text)
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
     except Exception as e:
         print("send_group_leaderboard failed:", repr(e))
         return
@@ -609,7 +635,7 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------
-# ✅ Reaction tracking (reactions received per user + per-message totals)
+# ✅ Reaction tracking
 # ----------------------------
 async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mr = getattr(update, "message_reaction", None)
@@ -637,7 +663,6 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with db_lock:
-        # find author of reacted message
         cursor.execute("""
             SELECT author_id, COALESCE(author_username, 'Unknown')
             FROM messages
@@ -645,13 +670,11 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (chat_id, message_id))
         row = cursor.fetchone()
         if not row:
-            # bot didn’t see the original message -> can’t attribute
             return
 
         author_id, author_username = row
         _ensure_user_row(chat_id, author_id, author_username)
 
-        # additions
         for emoji in added:
             cursor.execute("""
                 INSERT OR IGNORE INTO reactions
@@ -675,7 +698,6 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     DO UPDATE SET total_reactions = total_reactions + 1
                 """, (chat_id, message_id))
 
-        # removals
         for emoji in removed:
             cursor.execute("""
                 DELETE FROM reactions
@@ -728,7 +750,6 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
         conn.commit()
 
-    # ✅ Update the permanent group board (single-group)
     group_id = DEFAULT_GROUP_CHAT_ID
     if group_id:
         await update_group_leaderboard(context, group_id)
@@ -757,7 +778,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     view = "all" if show_all_time else "month"
 
     text = await render_leaderboard(group_chat_id, show_all_time)
-    await send_dm_only(update, context, text, reply_markup=leaderboard_keyboard(view))
+    await send_dm_only(update, context, text, parse_mode="Markdown", reply_markup=leaderboard_keyboard(view))
 
 async def render_stats(chat_id: int, user_id: int) -> str:
     async with db_lock:
@@ -841,7 +862,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
 
 
-# ✅ NEW: top reacted video (DM)
+# ✅ top reacted video (DM)
 async def render_top_reacted_video(chat_id: int) -> str:
     async with db_lock:
         cursor.execute("""
@@ -910,7 +931,6 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
             conn.commit()
 
-    # Update group board for this chat (and for DEFAULT_GROUP_CHAT_ID)
     await update_group_leaderboard(context, chat.id)
 
     try:
@@ -971,7 +991,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Single-group
     group_chat_id = DEFAULT_GROUP_CHAT_ID
     if not group_chat_id:
-        # fallback: last group user used
         group_chat_id = await get_user_last_chat(query.from_user.id)
 
     if not group_chat_id:
@@ -989,12 +1008,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "lb:month":
         text = await render_leaderboard(group_chat_id, show_all_time=False)
-        await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
+        await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"), parse_mode="Markdown")
         return
 
     if data == "lb:all":
         text = await render_leaderboard(group_chat_id, show_all_time=True)
-        await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"))
+        await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"), parse_mode="Markdown")
         return
 
     if data == "nav:stats":
@@ -1026,12 +1045,10 @@ async def post_init(app):
     except Exception:
         pass
 
-    # If you set DEFAULT_GROUP_CHAT_ID, create/update the permanent board on startup
     if DEFAULT_GROUP_CHAT_ID:
         try:
             await update_group_leaderboard(app.bot, DEFAULT_GROUP_CHAT_ID)  # (won't work: needs ContextTypes)
         except Exception:
-            # We'll do it via a short one-off job below in main()
             pass
 
 
@@ -1052,7 +1069,7 @@ def main():
     # Track ONLY non-command messages (so commands are not counted)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
-    # ✅ NEW: reaction updates (requires PTB >= 20.8; you should use 22.6)
+    # ✅ reactions
     app.add_handler(MessageReactionHandler(track_reactions), group=1)
 
     # DM-only commands
@@ -1086,7 +1103,7 @@ def main():
 
         app.job_queue.run_once(_startup_board, when=5)
 
-    # ✅ IMPORTANT: request reaction updates (and everything else) from Telegram
+    # ✅ request reaction updates
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
