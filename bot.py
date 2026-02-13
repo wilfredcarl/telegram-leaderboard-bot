@@ -268,6 +268,19 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
+def thread_id_from_update(update: Update | None) -> int | None:
+    """
+    If the command was typed inside a forum topic, this returns its message_thread_id.
+    If no topics, returns None.
+    """
+    if not update:
+        return None
+    msg = getattr(update, "effective_message", None)
+    if not msg:
+        return None
+    return getattr(msg, "message_thread_id", None)
+
+
 # ----------------------------
 # DM cleanup: delete the last "extra" DM messages when a new button is pressed
 # (We only store messages like the copied top video + its summary, not the control panel message.)
@@ -333,12 +346,10 @@ async def get_user_last_chat(user_id: int) -> int | None:
 
 
 async def resolve_group_chat_id(update: Update | None) -> int | None:
-    # If env or /setgroup defined a default group, use it
     fixed = await get_default_group_chat_id()
     if fixed:
         return fixed
 
-    # fallback: whatever group user last used a command in
     if update and update.effective_chat and update.effective_user:
         if update.effective_chat.type in ("group", "supergroup"):
             return update.effective_chat.id
@@ -348,7 +359,7 @@ async def resolve_group_chat_id(update: Update | None) -> int | None:
 
 
 # ----------------------------
-# DM-only sending (group notice 5s)
+# DM-only sending (group notice 5s) + reply in same topic
 # ----------------------------
 async def send_dm_only(
     update: Update,
@@ -394,14 +405,20 @@ async def send_dm_only(
     except Exception as e:
         print("DM failed:", repr(e))
 
-    # Group notice (auto-delete)
+    # Group notice (auto-delete) — ✅ in the same topic
+    tid = thread_id_from_update(update)
     try:
         if dm_ok:
-            notice = await context.bot.send_message(chat_id=chat.id, text="📩 Sent you a DM.")
+            notice = await context.bot.send_message(
+                chat_id=chat.id,
+                text="📩 Sent you a DM.",
+                message_thread_id=tid,
+            )
         else:
             notice = await context.bot.send_message(
                 chat_id=chat.id,
                 text="❗ I couldn't DM you. Please open the bot in private and press Start, then try again.",
+                message_thread_id=tid,
             )
         schedule_delete(context, chat.id, notice.message_id, DM_NOTICE_SECONDS)
     except Exception as e:
@@ -978,7 +995,6 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mid, author, reacts = top
 
-    # Delete any previously sent "extra" DM messages (e.g., last top video + summary)
     await delete_previous_extra_dm(context, user.id)
 
     sent_ids: list[int] = []
@@ -1016,9 +1032,15 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_ids.append(summary.message_id)
         await store_extra_dm_messages(user.id, sent_ids)
 
+        # Notice in the same topic where command was typed
         if update.effective_chat and update.effective_chat.type != "private":
+            tid = thread_id_from_update(update)
             try:
-                notice = await context.bot.send_message(update.effective_chat.id, "📩 Sent you the top video in DM.")
+                notice = await context.bot.send_message(
+                    update.effective_chat.id,
+                    "📩 Sent you the top video in DM.",
+                    message_thread_id=tid,
+                )
                 schedule_delete(context, update.effective_chat.id, notice.message_id, DM_NOTICE_SECONDS)
             except Exception:
                 pass
@@ -1047,7 +1069,7 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         try:
-            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update))
             schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
         except Exception:
             pass
@@ -1060,6 +1082,7 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat.id,
             f"✅ Default group set to this chat:\n`{chat.id}`\n\n(You can now use commands in DM.)",
             parse_mode="Markdown",
+            message_thread_id=thread_id_from_update(update),
         )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
@@ -1078,7 +1101,7 @@ async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         try:
-            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update))
             schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
         except Exception:
             pass
@@ -1096,11 +1119,14 @@ async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM meta WHERE key = ?", (f"group_lb_msg_id:{chat_id}",))
         conn.commit()
 
-    # recreate board
     await update_group_leaderboard(context, chat_id)
 
     try:
-        msg = await context.bot.send_message(chat.id, "✅ Reset stats for this group and refreshed the board.")
+        msg = await context.bot.send_message(
+            chat.id,
+            "✅ Reset stats for this group and refreshed the board.",
+            message_thread_id=thread_id_from_update(update),
+        )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
         pass
@@ -1115,7 +1141,7 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         try:
-            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update))
             schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
         except Exception:
             pass
@@ -1143,7 +1169,11 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_group_leaderboard(context, chat.id)
 
     try:
-        msg = await context.bot.send_message(chat.id, "✅ Awarded pending media and refreshed the board.")
+        msg = await context.bot.send_message(
+            chat.id,
+            "✅ Awarded pending media and refreshed the board.",
+            message_thread_id=thread_id_from_update(update),
+        )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
         pass
@@ -1162,7 +1192,7 @@ async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         try:
-            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update))
             schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
         except Exception:
             pass
@@ -1171,7 +1201,11 @@ async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_group_leaderboard(context, chat.id)
 
     try:
-        msg = await context.bot.send_message(chat.id, "📌 Leaderboard board created/updated.")
+        msg = await context.bot.send_message(
+            chat.id,
+            "📌 Leaderboard board created/updated.",
+            message_thread_id=thread_id_from_update(update),
+        )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
         pass
@@ -1188,7 +1222,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await ensure_month_is_current()
 
-    # Buttons are meant for DM
     if query.message.chat.type != "private":
         try:
             msg = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
@@ -1197,7 +1230,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ✅ Delete the last "extra" DM messages whenever ANY button is pressed
     await delete_previous_extra_dm(context, query.from_user.id)
 
     group_chat_id = await get_default_group_chat_id()
@@ -1317,13 +1349,9 @@ def main():
         .build()
     )
 
-    # Track ONLY non-command messages (handler only records media)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
-
-    # Reactions
     app.add_handler(MessageReactionHandler(track_reactions), group=1)
 
-    # DM-only commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
@@ -1331,16 +1359,13 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))
 
-    # Group admin commands
     app.add_handler(CommandHandler("board", board))
     app.add_handler(CommandHandler("forceaward", forceaward))
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("resetstats", resetstats))
 
-    # Buttons (DM)
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Jobs
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
     app.job_queue.run_monthly(
         monthly_reset_job,
@@ -1348,7 +1373,6 @@ def main():
         day=1,
     )
 
-    # Create/refresh group board shortly after startup (if default group known)
     async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
         gid = await get_default_group_chat_id()
         if gid:
@@ -1356,7 +1380,6 @@ def main():
 
     app.job_queue.run_once(_startup_board, when=5)
 
-    # IMPORTANT: request reaction updates
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
