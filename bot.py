@@ -23,8 +23,8 @@ from telegram.ext import (
 TOKEN = os.getenv("TOKEN")
 TZ = ZoneInfo("America/Montreal")
 
-# ⏱ For testing, keep notices visible longer
-AUTO_DELETE_SECONDS = 180  # change back to 30 later
+# ⏱ For testing, keep notices visible longer (set back to 30 later)
+AUTO_DELETE_SECONDS = 180
 
 DB_PATH = "leaderboard.db"
 
@@ -105,6 +105,7 @@ conn.commit()
 db_lock = asyncio.Lock()
 
 
+# --- DB migration helper (safe for existing DBs) ---
 def ensure_all_time_columns():
     cursor.execute("PRAGMA table_info(users)")
     columns = [row[1] for row in cursor.fetchall()]
@@ -211,7 +212,7 @@ async def resolve_group_chat_id(update: Update) -> int | None:
     return await get_user_last_chat(user.id)
 
 
-# --- DM-only sending (UPDATED: always tries to notify group + logs failures) ---
+# --- DM-only sending (always tries to notify group + logs failures) ---
 async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *,
                        parse_mode: str | None = None, reply_markup=None):
     chat = update.effective_chat
@@ -274,7 +275,7 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         print("Group notice failed:", repr(e))
 
 
-# --- Professional UI Keyboards ---
+# --- UI Keyboards ---
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -290,10 +291,8 @@ def home_keyboard() -> InlineKeyboardMarkup:
 
 
 def leaderboard_keyboard(view: str) -> InlineKeyboardMarkup:
-    if view == "all":
-        switch = InlineKeyboardButton("🏆 View Monthly", callback_data="lb:month")
-    else:
-        switch = InlineKeyboardButton("🕰 View All-Time", callback_data="lb:all")
+    switch = InlineKeyboardButton("🏆 View Monthly", callback_data="lb:month") if view == "all" \
+        else InlineKeyboardButton("🕰 View All-Time", callback_data="lb:all")
 
     return InlineKeyboardMarkup([
         [switch],
@@ -358,7 +357,6 @@ def _ensure_user_row(chat_id: int, user_id: int, username: str):
 
 def _award_count(chat_id: int, user_id: int, username: str, kind: str, n: int):
     _ensure_user_row(chat_id, user_id, username)
-
     if kind == "media":
         cursor.execute("""
             UPDATE users
@@ -394,18 +392,14 @@ def _previous_month_key() -> str:
 
 async def ensure_month_is_current():
     current_month = _current_month_key()
-
     async with db_lock:
         last_reset_month = _get_meta_sync("last_reset_month")
-
         if last_reset_month is None:
             _set_meta_sync("last_reset_month", current_month)
             conn.commit()
             return
-
         if last_reset_month == current_month:
             return
-
     await monthly_reset_internal()
 
 
@@ -444,10 +438,166 @@ async def monthly_reset_internal():
         conn.commit()
 
 
-# --- Probe handler (kept) ---
-async def probe_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # keep placeholder for any probe logic
-    return
+# --- Message Tracker (THIS FIXES YOUR NameError) ---
+async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user:
+        return
+
+    msg = update.message
+
+    # Ignore stickers
+    if msg.sticker:
+        return
+
+    chat_id = update.effective_chat.id
+    user = msg.from_user
+    username = user.username or user.first_name or "Unknown"
+
+    is_media = bool(
+        msg.photo
+        or msg.video
+        or msg.document
+        or msg.animation
+        or msg.voice
+    )
+
+    kind = "media" if is_media else "text"
+    created_at_utc = int(time_mod.time())
+
+    async with db_lock:
+        cursor.execute("""
+            INSERT OR IGNORE INTO pending_messages
+            (chat_id, message_id, user_id, username, kind, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
+        conn.commit()
+
+
+# --- Jobs ---
+async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
+    await ensure_month_is_current()
+
+    now = int(time_mod.time())
+    cutoff = now - 24 * 60 * 60
+
+    async with db_lock:
+        cursor.execute("""
+            SELECT chat_id, user_id, MAX(username) as username, kind, COUNT(*)
+            FROM pending_messages
+            WHERE created_at_utc <= ?
+            GROUP BY chat_id, user_id, kind
+        """, (cutoff,))
+        rows = cursor.fetchall()
+
+        if not rows:
+            return
+
+        for chat_id, user_id, username, kind, n in rows:
+            _award_count(chat_id, user_id, username, kind, n)
+
+        cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
+        conn.commit()
+
+
+async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
+    await monthly_reset_internal()
+
+
+# --- Rendering ---
+async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
+    async with db_lock:
+        if show_all_time:
+            cursor.execute("""
+                SELECT username, all_text_count, all_media_count, all_total_count
+                FROM users
+                WHERE chat_id = ?
+                ORDER BY all_total_count DESC
+                LIMIT 10
+            """, (chat_id,))
+            rows = cursor.fetchall()
+        else:
+            cursor.execute("""
+                SELECT username,
+                       text_count, media_count, total_count,
+                       all_text_count, all_media_count, all_total_count
+                FROM users
+                WHERE chat_id = ?
+                ORDER BY total_count DESC
+                LIMIT 10
+            """, (chat_id,))
+            rows = cursor.fetchall()
+
+    if not rows:
+        return "No data yet! (Messages count after 24h.)"
+
+    if show_all_time:
+        out = "🏆 Leaderboard — All-Time (Top 10)\n\n"
+        for i, (username, t, m, total) in enumerate(rows, start=1):
+            out += f"{rank_badge(i)} {username}\n   📝 {t}  •  🖼 {m}  •  📊 {total}\n\n"
+        return out
+
+    out = "🏆 Leaderboard — This Month (Top 10)\n\n"
+    for i, (username, t, m, total, at, am, a_total) in enumerate(rows, start=1):
+        out += (
+            f"{rank_badge(i)} {username}\n"
+            f"   📅 Month: 📝 {t}  •  🖼 {m}  •  📊 {total}\n"
+            f"   🕰 All-time: 📝 {at}  •  🖼 {am}  •  📊 {a_total}\n\n"
+        )
+    return out
+
+
+async def render_stats(chat_id: int, user_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT text_count, media_count, total_count,
+                   all_text_count, all_media_count, all_total_count
+            FROM users
+            WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, user_id))
+        row = cursor.fetchone()
+
+    if not row:
+        return "You have no stats yet! (Messages count after 24h.)"
+
+    t, m, total, at, am, a_total = row
+    return (
+        "📊 Your Stats\n\n"
+        "📅 This Month\n"
+        f"• 📝 Text: {t}\n"
+        f"• 🖼 Media: {m}\n"
+        f"• 📊 Total: {total}\n\n"
+        "🕰 All-Time\n"
+        f"• 📝 Text: {at}\n"
+        f"• 🖼 Media: {am}\n"
+        f"• 📊 Total: {a_total}\n\n"
+        "⏳ Messages are awarded after 24 hours."
+    )
+
+
+async def render_hof(chat_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT month, rank, username, total_count
+            FROM hall_of_fame
+            WHERE chat_id = ?
+            ORDER BY month DESC, rank ASC
+            LIMIT 36
+        """, (chat_id,))
+        rows = cursor.fetchall()
+
+    if not rows:
+        return "🏅 No Hall of Fame data yet (first snapshot happens on the 1st)."
+
+    out = "🏅 Hall of Fame — Top 3 per Month\n\n"
+    current = None
+    for month, rank, username, total in rows:
+        if month != current:
+            current = month
+            out += f"📅 {month}\n"
+        out += f"  {rank_badge(rank)} {username} — {total}\n"
+        if rank == 3:
+            out += "\n"
+    return out
 
 
 # --- Commands ---
@@ -477,14 +627,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_dm_only(update, context, "❗ Run `/stats` once in your group first.")
         return
 
-    user = update.effective_user
-    text = await render_stats(group_chat_id, user.id)
+    text = await render_stats(group_chat_id, update.effective_user.id)
     await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
 
 
 async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
-
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
         await send_dm_only(update, context, "❗ Run `/hof` once in your group first.")
@@ -539,7 +687,7 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
-# --- Button Callback Handler (DM) ---
+# --- Buttons (DM) ---
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not query.message:
@@ -594,108 +742,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# --- Rendering helpers ---
-async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
-    async with db_lock:
-        if show_all_time:
-            cursor.execute("""
-                SELECT username, all_text_count, all_media_count, all_total_count
-                FROM users
-                WHERE chat_id = ?
-                ORDER BY all_total_count DESC
-                LIMIT 10
-            """, (chat_id,))
-            rows = cursor.fetchall()
-        else:
-            cursor.execute("""
-                SELECT username,
-                       text_count, media_count, total_count,
-                       all_text_count, all_media_count, all_total_count
-                FROM users
-                WHERE chat_id = ?
-                ORDER BY total_count DESC
-                LIMIT 10
-            """, (chat_id,))
-            rows = cursor.fetchall()
-
-    if not rows:
-        return "No data yet! (Messages count after 24h.)"
-
-    if show_all_time:
-        message = "🏆 Leaderboard — All-Time (Top 10)\n\n"
-        for i, (username, t, m, total) in enumerate(rows, start=1):
-            message += f"{rank_badge(i)} {username}\n   📝 {t}  •  🖼 {m}  •  📊 {total}\n\n"
-        return message
-
-    message = "🏆 Leaderboard — This Month (Top 10)\n\n"
-    for i, (username, t, m, total, at, am, a_total) in enumerate(rows, start=1):
-        message += (
-            f"{rank_badge(i)} {username}\n"
-            f"   📅 Month: 📝 {t}  •  🖼 {m}  •  📊 {total}\n"
-            f"   🕰 All-time: 📝 {at}  •  🖼 {am}  •  📊 {a_total}\n\n"
-        )
-    return message
-
-
-async def render_stats(chat_id: int, user_id: int) -> str:
-    async with db_lock:
-        cursor.execute("""
-            SELECT text_count, media_count, total_count,
-                   all_text_count, all_media_count, all_total_count
-            FROM users
-            WHERE chat_id = ? AND user_id = ?
-        """, (chat_id, user_id))
-        row = cursor.fetchone()
-
-    if not row:
-        return "You have no stats yet! (Messages count after 24h.)"
-
-    t, m, total, at, am, a_total = row
-    return (
-        "📊 Your Stats\n\n"
-        "📅 This Month\n"
-        f"• 📝 Text: {t}\n"
-        f"• 🖼 Media: {m}\n"
-        f"• 📊 Total: {total}\n\n"
-        "🕰 All-Time\n"
-        f"• 📝 Text: {at}\n"
-        f"• 🖼 Media: {am}\n"
-        f"• 📊 Total: {a_total}\n\n"
-        "⏳ Messages are awarded after 24 hours."
-    )
-
-
-async def render_hof(chat_id: int) -> str:
-    async with db_lock:
-        cursor.execute("""
-            SELECT month, rank, username, total_count
-            FROM hall_of_fame
-            WHERE chat_id = ?
-            ORDER BY month DESC, rank ASC
-            LIMIT 36
-        """, (chat_id,))
-        rows = cursor.fetchall()
-
-    if not rows:
-        return "🏅 No Hall of Fame data yet (first snapshot happens on the 1st)."
-
-    out = "🏅 Hall of Fame — Top 3 per Month\n\n"
-    current_month = None
-    for month, rank, username, total in rows:
-        if month != current_month:
-            current_month = month
-            out += f"📅 {month}\n"
-        out += f"  {rank_badge(rank)} {username} — {total}\n"
-        if rank == 3:
-            out += "\n"
-    return out
-
-
-# --- Monthly Reset Job ---
-async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
-    await monthly_reset_internal()
-
-
 # --- App lifecycle ---
 async def post_init(app):
     await ensure_month_is_current()
@@ -723,21 +769,22 @@ def main():
         .build()
     )
 
-    # ✅ Tracker ignores commands (so commands are not counted)
+    # Track non-command messages only
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
+    # Commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))
-
     app.add_handler(CommandHandler("forceaward", forceaward))
 
+    # Buttons
     app.add_handler(CallbackQueryHandler(on_button))
 
+    # Jobs
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
-
     app.job_queue.run_monthly(
         monthly_reset,
         when=time(hour=0, minute=5, tzinfo=TZ),
