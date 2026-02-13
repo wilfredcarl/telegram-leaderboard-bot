@@ -282,7 +282,7 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         )
         return
 
-    # Save last group for this user (helpful if DEFAULT_GROUP_CHAT_ID isn't set during testing)
+    # Save last group for this user
     try:
         await save_user_context(user.id, chat.id)
     except Exception as e:
@@ -302,7 +302,7 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     except Exception as e:
         print("DM failed:", repr(e))
 
-    # Always try to notify the group (5 seconds only)
+    # Group notice (auto-delete)
     try:
         if dm_ok:
             notice = await context.bot.send_message(chat_id=chat.id, text="📩 Sent you a DM.")
@@ -364,13 +364,13 @@ def help_text() -> str:
         "*History*\n"
         "• `/hof` — Hall of Fame (Top 3 each month)\n\n"
         "*Reactions*\n"
-        "• ❤️ counted as *reactions received* on your messages\n"
+        "• ❤️ counted as *reactions received* on your media\n"
         "• `/topvideo` — Top reacted video (DM)\n\n"
         "*Group Board*\n"
         "• `/board` — Create/refresh the permanent group leaderboard (admin)\n\n"
         "*Admin*\n"
-        "• `/forceaward` — Award pending messages\n\n"
-        "⏳ Messages count *24 hours after posting*."
+        "• `/forceaward` — Award pending media\n\n"
+        "⏳ Media counts *24 hours after posting*."
     )
 
 def rank_badge(i: int) -> str:
@@ -400,28 +400,15 @@ def _ensure_user_row(chat_id: int, user_id: int, username: str):
             VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
         """, (chat_id, user_id, username))
 
-def _award_count(chat_id: int, user_id: int, username: str, kind: str, n: int):
+def _award_media(chat_id: int, user_id: int, username: str, n: int):
     _ensure_user_row(chat_id, user_id, username)
-    if kind == "media":
-        cursor.execute("""
-            UPDATE users
-            SET media_count = media_count + ?,
-                total_count = total_count + ?,
-                all_media_count = all_media_count + ?,
-                all_total_count = all_total_count + ?,
-                username = ?
-            WHERE chat_id = ? AND user_id = ?
-        """, (n, n, n, n, username, chat_id, user_id))
-    else:
-        cursor.execute("""
-            UPDATE users
-            SET text_count = text_count + ?,
-                total_count = total_count + ?,
-                all_text_count = all_text_count + ?,
-                all_total_count = all_total_count + ?,
-                username = ?
-            WHERE chat_id = ? AND user_id = ?
-        """, (n, n, n, n, username, chat_id, user_id))
+    cursor.execute("""
+        UPDATE users
+        SET media_count = media_count + ?,
+            all_media_count = all_media_count + ?,
+            username = ?
+        WHERE chat_id = ? AND user_id = ?
+    """, (n, n, username, chat_id, user_id))
 
 def _current_month_key() -> str:
     return datetime.now(TZ).strftime("%Y-%m")
@@ -452,25 +439,29 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
+            # Top 3 by MEDIA, with reactions as tiebreaker
             cursor.execute("""
-                SELECT user_id, username, text_count, media_count, total_count
+                SELECT user_id, username, media_count, react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY total_count DESC
+                ORDER BY media_count DESC, react_count DESC
                 LIMIT 3
             """, (chat_id,))
             top3 = cursor.fetchall()
 
-            for idx, (user_id, username, text_c, media_c, total_c) in enumerate(top3, start=1):
+            # hall_of_fame schema expects total_count/text_count/media_count (NOT NULL)
+            # We'll store media as "total_count" too, and 0 for text_count.
+            for idx, (user_id, username, media_c, _react_c) in enumerate(top3, start=1):
                 cursor.execute("""
                     INSERT OR REPLACE INTO hall_of_fame
                     (chat_id, month, rank, user_id, username, total_count, text_count, media_count)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (chat_id, honor_month, idx, user_id, username, total_c, text_c, media_c))
+                """, (chat_id, honor_month, idx, user_id, username, media_c, 0, media_c))
 
+            # Reset monthly media + reactions (leave old columns alone but unused)
             cursor.execute("""
                 UPDATE users
-                SET text_count = 0, media_count = 0, total_count = 0,
+                SET media_count = 0,
                     react_count = 0
                 WHERE chat_id = ?
             """, (chat_id,))
@@ -480,59 +471,55 @@ async def monthly_reset_internal():
 
 
 # ----------------------------
-# Permanent group leaderboard (single message that updates)
+# Unified leaderboard renderer (same style everywhere)
+# Ranking: media desc, reactions desc (tiebreaker)
 # ----------------------------
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
 
 async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
-    """
-    ✅ Unified emoji style used EVERYWHERE:
-    - Monthly: monthly only
-    - All-time: all-time only
-    """
     await ensure_month_is_current()
 
     async with db_lock:
         if show_all_time:
             cursor.execute("""
-                SELECT username, all_text_count, all_media_count, all_total_count, all_react_count
+                SELECT username, all_media_count, all_react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY all_total_count DESC
+                ORDER BY all_media_count DESC, all_react_count DESC
                 LIMIT 10
             """, (chat_id,))
             rows = cursor.fetchall()
         else:
             cursor.execute("""
-                SELECT username, text_count, media_count, total_count, react_count
+                SELECT username, media_count, react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY total_count DESC
+                ORDER BY media_count DESC, react_count DESC
                 LIMIT 10
             """, (chat_id,))
             rows = cursor.fetchall()
 
     title = "🏆 *Leaderboard — All-Time (Top 10)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 10)*"
-    subtitle = "_📝 text • 🖼 media • 📊 total • ❤️ reactions received_"
+    subtitle = "_🖼 media • ❤️ reactions received (tiebreaker)_"
 
     if not rows:
-        return f"{title}\n\nNo data yet! (Messages count after 24h.)"
+        return f"{title}\n\nNo data yet! (Media counts after 24h.)"
 
     out = f"{title}\n{subtitle}\n\n"
-    for i, (username, t, m, total, r) in enumerate(rows, start=1):
+    for i, (username, media_c, react_c) in enumerate(rows, start=1):
         name = username or "Unknown"
         out += (
             f"{rank_badge(i)} *{name}*\n"
-            f"   📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n\n"
+            f"   🖼 {media_c}  •  ❤️ {react_c}\n\n"
         )
     return out.strip()
 
+
+# ----------------------------
+# Permanent group leaderboard (single message that updates)
+# ----------------------------
 async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """
-    ✅ Matches Monthly button
-    ✅ Uses the same emoji style everywhere
-    """
     await ensure_month_is_current()
     text = await render_leaderboard(chat_id, show_all_time=False)
 
@@ -576,13 +563,13 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
 # ----------------------------
 # Tracking messages (non-command only)
+# Only track MEDIA. (No "messages sent" / text stats at all.)
 # ----------------------------
 async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
     msg = update.message
-
     if msg.sticker:
         return
 
@@ -590,10 +577,14 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = msg.from_user
     username = user.username or user.first_name or "Unknown"
 
+    # ✅ Only count media
     is_media = bool(msg.photo or msg.video or msg.document or msg.animation or msg.voice)
-    kind = "media" if is_media else "text"
+    if not is_media:
+        return
+
     created_at_utc = int(time_mod.time())
 
+    # video detection for "top reacted video"
     is_video = bool(msg.video)
     if msg.document and (msg.document.mime_type or "").startswith("video/"):
         is_video = True
@@ -602,8 +593,8 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("""
             INSERT OR IGNORE INTO pending_messages
             (chat_id, message_id, user_id, username, kind, created_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
+            VALUES (?, ?, ?, ?, 'media', ?)
+        """, (chat_id, msg.message_id, user.id, username, created_at_utc))
 
         cursor.execute("""
             INSERT OR REPLACE INTO messages
@@ -615,7 +606,7 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------
-# Reaction tracking
+# Reaction tracking (reactions received)
 # ----------------------------
 async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mr = getattr(update, "message_reaction", None)
@@ -650,6 +641,7 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (chat_id, message_id))
         row = cursor.fetchone()
         if not row:
+            # bot didn’t see the original media message -> can’t attribute
             return
 
         author_id, author_username = row
@@ -714,18 +706,19 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
 
     async with db_lock:
         cursor.execute("""
-            SELECT chat_id, user_id, MAX(username) as username, kind, COUNT(*)
+            SELECT chat_id, user_id, MAX(username) as username, COUNT(*)
             FROM pending_messages
             WHERE created_at_utc <= ?
-            GROUP BY chat_id, user_id, kind
+              AND kind = 'media'
+            GROUP BY chat_id, user_id
         """, (cutoff,))
         rows = cursor.fetchall()
 
         if not rows:
             return
 
-        for chat_id, user_id, username, kind, n in rows:
-            _award_count(chat_id, user_id, username, kind, n)
+        for chat_id, user_id, username, n in rows:
+            _award_media(chat_id, user_id, username, n)
 
         cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
         conn.commit()
@@ -763,30 +756,26 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_stats(chat_id: int, user_id: int) -> str:
     async with db_lock:
         cursor.execute("""
-            SELECT text_count, media_count, total_count, react_count,
-                   all_text_count, all_media_count, all_total_count, all_react_count
+            SELECT media_count, react_count,
+                   all_media_count, all_react_count
             FROM users
             WHERE chat_id = ? AND user_id = ?
         """, (chat_id, user_id))
         row = cursor.fetchone()
 
     if not row:
-        return "You have no stats yet! (Messages count after 24h.)"
+        return "You have no stats yet! (Media counts after 24h.)"
 
-    t, m, total, r, at, am, a_total, ar = row
+    m, r, am, ar = row
     return (
         "📊 Your Stats\n\n"
         "📅 This Month\n"
-        f"• 📝 Text: {t}\n"
         f"• 🖼 Media: {m}\n"
-        f"• 📊 Total: {total}\n"
         f"• ❤️ Reactions received: {r}\n\n"
         "🕰 All-Time\n"
-        f"• 📝 Text: {at}\n"
         f"• 🖼 Media: {am}\n"
-        f"• 📊 Total: {a_total}\n"
         f"• ❤️ Reactions received: {ar}\n\n"
-        "⏳ Messages are awarded after 24 hours."
+        "⏳ Media is awarded after 24 hours."
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -804,7 +793,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_hof(chat_id: int) -> str:
     async with db_lock:
         cursor.execute("""
-            SELECT month, rank, username, total_count
+            SELECT month, rank, username, media_count
             FROM hall_of_fame
             WHERE chat_id = ?
             ORDER BY month DESC, rank ASC
@@ -817,11 +806,11 @@ async def render_hof(chat_id: int) -> str:
 
     out = "🏅 Hall of Fame — Top 3 per Month\n\n"
     current = None
-    for month, rank, username, total in rows:
+    for month, rank, username, media_c in rows:
         if month != current:
             current = month
             out += f"📅 {month}\n"
-        out += f"  {rank_badge(rank)} {username} — {total}\n"
+        out += f"  {rank_badge(rank)} {username} — 🖼 {media_c}\n"
         if rank == 3:
             out += "\n"
     return out
@@ -842,7 +831,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
 
 
+# ----------------------------
 # Top reacted video (DM)
+# ----------------------------
 async def render_top_reacted_video(chat_id: int) -> str:
     async with db_lock:
         cursor.execute("""
@@ -897,16 +888,17 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with db_lock:
         cursor.execute("""
-            SELECT user_id, MAX(username) as username, kind, COUNT(*)
+            SELECT user_id, MAX(username) as username, COUNT(*)
             FROM pending_messages
             WHERE chat_id = ?
-            GROUP BY user_id, kind
+              AND kind = 'media'
+            GROUP BY user_id
         """, (chat.id,))
         rows = cursor.fetchall()
 
         if rows:
-            for user_id, username, kind, n in rows:
-                _award_count(chat.id, user_id, username, kind, n)
+            for user_id, username, n in rows:
+                _award_media(chat.id, user_id, username, n)
 
             cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
             conn.commit()
@@ -914,7 +906,7 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_group_leaderboard(context, chat.id)
 
     try:
-        msg = await context.bot.send_message(chat.id, "✅ Awarded pending messages and refreshed the board.")
+        msg = await context.bot.send_message(chat.id, "✅ Awarded pending media and refreshed the board.")
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
         pass
@@ -958,6 +950,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await ensure_month_is_current()
 
+    # Buttons are meant for DM
     if query.message.chat.type != "private":
         try:
             msg = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
@@ -1017,11 +1010,12 @@ async def post_init(app):
             BotCommand("topvideo", "DM: top reacted video"),
             BotCommand("help", "DM: show commands"),
             BotCommand("board", "Admin (group): create/refresh the permanent leaderboard board"),
-            BotCommand("forceaward", "Admin (group): award pending messages"),
+            BotCommand("forceaward", "Admin (group): award pending media"),
         ])
     except Exception:
         pass
 
+    # If you set DEFAULT_GROUP_CHAT_ID, create/update the permanent board on startup
     if DEFAULT_GROUP_CHAT_ID:
         try:
             await update_group_leaderboard(app.bot, DEFAULT_GROUP_CHAT_ID)  # (won't work: needs ContextTypes)
@@ -1043,9 +1037,13 @@ def main():
         .build()
     )
 
+    # Track ONLY non-command messages (media only inside handler)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
+
+    # Reactions (PTB 20.8+, recommended 22.6)
     app.add_handler(MessageReactionHandler(track_reactions), group=1)
 
+    # DM-only commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
@@ -1053,11 +1051,14 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))
 
+    # Group admin commands
     app.add_handler(CommandHandler("board", board))
     app.add_handler(CommandHandler("forceaward", forceaward))
 
+    # Buttons (DM)
     app.add_handler(CallbackQueryHandler(on_button))
 
+    # Jobs
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
 
     app.job_queue.run_monthly(
@@ -1066,12 +1067,13 @@ def main():
         day=1,
     )
 
+    # Create/refresh group board shortly after startup (Context is available here)
     if DEFAULT_GROUP_CHAT_ID:
         async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
             await update_group_leaderboard(ctx, DEFAULT_GROUP_CHAT_ID)
-
         app.job_queue.run_once(_startup_board, when=5)
 
+    # IMPORTANT: request reaction updates
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
