@@ -17,6 +17,7 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
+    MessageReactionHandler,   # ✅ NEW (PTB 22.x)
     filters,
 )
 
@@ -113,6 +114,41 @@ CREATE TABLE IF NOT EXISTS user_context (
 )
 """)
 
+# ✅ NEW: permanent message store so reactions can be credited to the author
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS messages (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    author_username TEXT,
+    is_video INTEGER DEFAULT 0,
+    created_at_utc INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+)
+""")
+
+# ✅ NEW: track who reacted (so adds/removes don’t double count)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reactions (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    reactor_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at_utc INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, reactor_id, emoji)
+)
+""")
+
+# ✅ NEW: per-message reaction totals (for top reacted video)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS message_reaction_totals (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    total_reactions INTEGER DEFAULT 0,
+    PRIMARY KEY (chat_id, message_id)
+)
+""")
+
 conn.commit()
 
 def ensure_all_time_columns():
@@ -129,6 +165,21 @@ def ensure_all_time_columns():
     conn.commit()
 
 ensure_all_time_columns()
+
+# ✅ NEW: ensure reaction columns on users
+def ensure_reaction_columns():
+    cursor.execute("PRAGMA table_info(users)")
+    cols = {row[1] for row in cursor.fetchall()}
+    needed = {
+        "react_count": "ALTER TABLE users ADD COLUMN react_count INTEGER DEFAULT 0",
+        "all_react_count": "ALTER TABLE users ADD COLUMN all_react_count INTEGER DEFAULT 0",
+    }
+    for col, stmt in needed.items():
+        if col not in cols:
+            cursor.execute(stmt)
+    conn.commit()
+
+ensure_reaction_columns()
 
 
 # ----------------------------
@@ -313,6 +364,9 @@ def help_text() -> str:
         "• `/stats` — Your totals\n\n"
         "*History*\n"
         "• `/hof` — Hall of Fame (Top 3 each month)\n\n"
+        "*Reactions*\n"
+        "• ❤️ counted as *reactions received* on your messages\n"
+        "• `/topvideo` — Top reacted video (DM)\n\n"
         "*Group Board*\n"
         "• `/board` — Create/refresh the permanent group leaderboard (admin)\n\n"
         "*Admin*\n"
@@ -414,9 +468,11 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, total_c, text_c, media_c))
 
+            # ✅ reset monthly counts incl reactions received
             cursor.execute("""
                 UPDATE users
-                SET text_count = 0, media_count = 0, total_count = 0
+                SET text_count = 0, media_count = 0, total_count = 0,
+                    react_count = 0
                 WHERE chat_id = ?
             """, (chat_id,))
 
@@ -434,7 +490,7 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
     async with db_lock:
         if show_all_time:
             cursor.execute("""
-                SELECT username, all_text_count, all_media_count, all_total_count
+                SELECT username, all_text_count, all_media_count, all_total_count, all_react_count
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY all_total_count DESC
@@ -443,8 +499,8 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             rows = cursor.fetchall()
         else:
             cursor.execute("""
-                SELECT username, text_count, media_count, total_count,
-                       all_text_count, all_media_count, all_total_count
+                SELECT username, text_count, media_count, total_count, react_count,
+                       all_text_count, all_media_count, all_total_count, all_react_count
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY total_count DESC
@@ -457,16 +513,16 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
 
     if show_all_time:
         out = "🏆 Leaderboard — All-Time (Top 10)\n\n"
-        for i, (username, t, m, total) in enumerate(rows, start=1):
-            out += f"{rank_badge(i)} {username}\n   📝 {t}  •  🖼 {m}  •  📊 {total}\n\n"
+        for i, (username, t, m, total, r) in enumerate(rows, start=1):
+            out += f"{rank_badge(i)} {username}\n   📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n\n"
         return out
 
     out = "🏆 Leaderboard — This Month (Top 10)\n\n"
-    for i, (username, t, m, total, at, am, a_total) in enumerate(rows, start=1):
+    for i, (username, t, m, total, r, at, am, a_total, ar) in enumerate(rows, start=1):
         out += (
             f"{rank_badge(i)} {username}\n"
-            f"   📅 Month: 📝 {t}  •  🖼 {m}  •  📊 {total}\n"
-            f"   🕰 All-time: 📝 {at}  •  🖼 {am}  •  📊 {a_total}\n\n"
+            f"   📅 Month: 📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n"
+            f"   🕰 All-time: 📝 {at}  •  🖼 {am}  •  📊 {a_total}  •  ❤️ {ar}\n\n"
         )
     return out
 
@@ -530,12 +586,118 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind = "media" if is_media else "text"
     created_at_utc = int(time_mod.time())
 
+    # ✅ video detection for "top reacted video"
+    is_video = bool(msg.video)
+    if msg.document and (msg.document.mime_type or "").startswith("video/"):
+        is_video = True
+
     async with db_lock:
         cursor.execute("""
             INSERT OR IGNORE INTO pending_messages
             (chat_id, message_id, user_id, username, kind, created_at_utc)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
+
+        # ✅ NEW: permanent mapping for reaction attribution
+        cursor.execute("""
+            INSERT OR REPLACE INTO messages
+            (chat_id, message_id, author_id, author_username, is_video, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, msg.message_id, user.id, username, 1 if is_video else 0, created_at_utc))
+
+        conn.commit()
+
+
+# ----------------------------
+# ✅ Reaction tracking (reactions received per user + per-message totals)
+# ----------------------------
+async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mr = getattr(update, "message_reaction", None)
+    if not mr or not mr.chat or not mr.user:
+        return
+
+    chat_id = mr.chat.id
+    message_id = mr.message_id
+    reactor_id = mr.user.id
+    now = int(time_mod.time())
+
+    old_list = mr.old_reaction or []
+    new_list = mr.new_reaction or []
+
+    def emoji_of(r):
+        return getattr(r, "emoji", None) or str(r)
+
+    old_set = {emoji_of(r) for r in old_list}
+    new_set = {emoji_of(r) for r in new_list}
+
+    added = new_set - old_set
+    removed = old_set - new_set
+
+    if not added and not removed:
+        return
+
+    async with db_lock:
+        # find author of reacted message
+        cursor.execute("""
+            SELECT author_id, COALESCE(author_username, 'Unknown')
+            FROM messages
+            WHERE chat_id = ? AND message_id = ?
+        """, (chat_id, message_id))
+        row = cursor.fetchone()
+        if not row:
+            # bot didn’t see the original message -> can’t attribute
+            return
+
+        author_id, author_username = row
+        _ensure_user_row(chat_id, author_id, author_username)
+
+        # additions
+        for emoji in added:
+            cursor.execute("""
+                INSERT OR IGNORE INTO reactions
+                (chat_id, message_id, reactor_id, emoji, created_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chat_id, message_id, reactor_id, emoji, now))
+
+            if cursor.rowcount:
+                cursor.execute("""
+                    UPDATE users
+                    SET react_count = react_count + 1,
+                        all_react_count = all_react_count + 1,
+                        username = ?
+                    WHERE chat_id = ? AND user_id = ?
+                """, (author_username, chat_id, author_id))
+
+                cursor.execute("""
+                    INSERT INTO message_reaction_totals (chat_id, message_id, total_reactions)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(chat_id, message_id)
+                    DO UPDATE SET total_reactions = total_reactions + 1
+                """, (chat_id, message_id))
+
+        # removals
+        for emoji in removed:
+            cursor.execute("""
+                DELETE FROM reactions
+                WHERE chat_id = ? AND message_id = ? AND reactor_id = ? AND emoji = ?
+            """, (chat_id, message_id, reactor_id, emoji))
+
+            if cursor.rowcount:
+                cursor.execute("""
+                    UPDATE users
+                    SET react_count = MAX(react_count - 1, 0),
+                        all_react_count = MAX(all_react_count - 1, 0),
+                        username = ?
+                    WHERE chat_id = ? AND user_id = ?
+                """, (author_username, chat_id, author_id))
+
+                cursor.execute("""
+                    INSERT INTO message_reaction_totals (chat_id, message_id, total_reactions)
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(chat_id, message_id)
+                    DO UPDATE SET total_reactions = MAX(total_reactions - 1, 0)
+                """, (chat_id, message_id))
+
         conn.commit()
 
 
@@ -600,8 +762,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_stats(chat_id: int, user_id: int) -> str:
     async with db_lock:
         cursor.execute("""
-            SELECT text_count, media_count, total_count,
-                   all_text_count, all_media_count, all_total_count
+            SELECT text_count, media_count, total_count, react_count,
+                   all_text_count, all_media_count, all_total_count, all_react_count
             FROM users
             WHERE chat_id = ? AND user_id = ?
         """, (chat_id, user_id))
@@ -610,17 +772,19 @@ async def render_stats(chat_id: int, user_id: int) -> str:
     if not row:
         return "You have no stats yet! (Messages count after 24h.)"
 
-    t, m, total, at, am, a_total = row
+    t, m, total, r, at, am, a_total, ar = row
     return (
         "📊 Your Stats\n\n"
         "📅 This Month\n"
         f"• 📝 Text: {t}\n"
         f"• 🖼 Media: {m}\n"
-        f"• 📊 Total: {total}\n\n"
+        f"• 📊 Total: {total}\n"
+        f"• ❤️ Reactions received: {r}\n\n"
         "🕰 All-Time\n"
         f"• 📝 Text: {at}\n"
         f"• 🖼 Media: {am}\n"
-        f"• 📊 Total: {a_total}\n\n"
+        f"• 📊 Total: {a_total}\n"
+        f"• ❤️ Reactions received: {ar}\n\n"
         "⏳ Messages are awarded after 24 hours."
     )
 
@@ -677,6 +841,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
 
 
+# ✅ NEW: top reacted video (DM)
+async def render_top_reacted_video(chat_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT m.message_id,
+                   COALESCE(m.author_username, 'Unknown') AS author,
+                   COALESCE(t.total_reactions, 0) AS reacts
+            FROM messages m
+            LEFT JOIN message_reaction_totals t
+              ON t.chat_id = m.chat_id AND t.message_id = m.message_id
+            WHERE m.chat_id = ? AND m.is_video = 1
+            ORDER BY reacts DESC, m.created_at_utc DESC
+            LIMIT 1
+        """, (chat_id,))
+        row = cursor.fetchone()
+
+    if not row:
+        return "🎬 Top reacted video: none yet."
+    mid, author, reacts = row
+    return f"🎬 Top reacted video: message_id={mid} by @{author} — ❤️ {reacts} reactions"
+
+async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
+    group_chat_id = await resolve_group_chat_id(update)
+    if not group_chat_id:
+        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
+        return
+
+    text = await render_top_reacted_video(group_chat_id)
+    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
+
+
 # ----------------------------
 # Group-only admin commands
 # ----------------------------
@@ -706,9 +903,7 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (chat.id,))
         rows = cursor.fetchall()
 
-        if not rows:
-            pass
-        else:
+        if rows:
             for user_id, username, kind, n in rows:
                 _award_count(chat.id, user_id, username, kind, n)
 
@@ -823,6 +1018,7 @@ async def post_init(app):
             BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
+            BotCommand("topvideo", "DM: top reacted video"),
             BotCommand("help", "DM: show commands"),
             BotCommand("board", "Admin (group): create/refresh the permanent leaderboard board"),
             BotCommand("forceaward", "Admin (group): award pending messages"),
@@ -856,10 +1052,14 @@ def main():
     # Track ONLY non-command messages (so commands are not counted)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
+    # ✅ NEW: reaction updates (requires PTB >= 20.8; you should use 22.6)
+    app.add_handler(MessageReactionHandler(track_reactions), group=1)
+
     # DM-only commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
+    app.add_handler(CommandHandler("topvideo", topvideo))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))
 
@@ -886,7 +1086,8 @@ def main():
 
         app.job_queue.run_once(_startup_board, when=5)
 
-    app.run_polling()
+    # ✅ IMPORTANT: request reaction updates (and everything else) from Telegram
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
