@@ -45,9 +45,10 @@ def parse_int_env(name: str, default: int = 0) -> int:
         return default
 
 
-# ✅ Recommended: set this in Railway Variables to your single group
+# Optional: if you set this env var, bot runs in "single fixed group" mode
 # DEFAULT_GROUP_CHAT_ID = -1001234567890
-DEFAULT_GROUP_CHAT_ID = parse_int_env("DEFAULT_GROUP_CHAT_ID", 0)
+DEFAULT_GROUP_CHAT_ID_ENV = parse_int_env("DEFAULT_GROUP_CHAT_ID", 0)
+META_DEFAULT_GROUP_KEY = "default_group_chat_id"
 
 
 # ----------------------------
@@ -209,11 +210,6 @@ def _del_meta_sync(key: str):
     cursor.execute("DELETE FROM meta WHERE key = ?", (key,))
 
 
-async def get_meta(key: str) -> str | None:
-    async with db_lock:
-        return _get_meta_sync(key)
-
-
 async def set_meta(key: str, value: str):
     async with db_lock:
         _set_meta_sync(key, value)
@@ -224,6 +220,27 @@ async def del_meta(key: str):
     async with db_lock:
         _del_meta_sync(key)
         conn.commit()
+
+
+async def get_default_group_chat_id() -> int | None:
+    """
+    Priority:
+    1) DEFAULT_GROUP_CHAT_ID env var (fixed)
+    2) meta default_group_chat_id (set by /setgroup in the group)
+    3) None
+    """
+    if DEFAULT_GROUP_CHAT_ID_ENV:
+        return DEFAULT_GROUP_CHAT_ID_ENV
+
+    async with db_lock:
+        raw = _get_meta_sync(META_DEFAULT_GROUP_KEY)
+    if not raw:
+        return None
+    try:
+        v = int(str(raw).strip())
+        return v if v else None
+    except ValueError:
+        return None
 
 
 # ----------------------------
@@ -267,7 +284,6 @@ async def delete_previous_extra_dm(context: ContextTypes.DEFAULT_TYPE, user_id: 
     if not raw:
         return
 
-    # raw is a comma-separated list of message_ids
     ids: list[int] = []
     for part in str(raw).split(","):
         part = part.strip()
@@ -288,7 +304,6 @@ async def delete_previous_extra_dm(context: ContextTypes.DEFAULT_TYPE, user_id: 
 
 
 async def store_extra_dm_messages(user_id: int, message_ids: list[int]):
-    # Store comma-separated ids
     key = _last_extra_dm_key(user_id)
     payload = ",".join(str(m) for m in message_ids if m)
     if not payload:
@@ -318,9 +333,10 @@ async def get_user_last_chat(user_id: int) -> int | None:
 
 
 async def resolve_group_chat_id(update: Update | None) -> int | None:
-    # single-group mode
-    if DEFAULT_GROUP_CHAT_ID:
-        return DEFAULT_GROUP_CHAT_ID
+    # If env or /setgroup defined a default group, use it
+    fixed = await get_default_group_chat_id()
+    if fixed:
+        return fixed
 
     # fallback: whatever group user last used a command in
     if update and update.effective_chat and update.effective_user:
@@ -401,9 +417,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏆 Monthly", callback_data="lb:month"),
             InlineKeyboardButton("🕰 All-Time", callback_data="lb:all"),
         ],
-        [
-            InlineKeyboardButton("🎬 Top Video", callback_data="nav:topvideo"),
-        ],
+        [InlineKeyboardButton("🎬 Top Video", callback_data="nav:topvideo")],
         [
             InlineKeyboardButton("📊 My Stats", callback_data="nav:stats"),
             InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof"),
@@ -451,7 +465,9 @@ def help_text() -> str:
         "• ❤️ counted as *reactions received* on your media\n"
         "• `/topvideo` — DM the most reacted video\n\n"
         "*Group Board*\n"
-        "• `/board` — Create/refresh the permanent group leaderboard (admin)\n\n"
+        "• `/board` — Create/refresh the permanent group leaderboard (admin)\n"
+        "• `/setgroup` — Set this group as the default group (admin)\n"
+        "• `/resetstats` — Reset stats for this group (admin)\n\n"
         "*Admin*\n"
         "• `/forceaward` — Award pending media\n\n"
         "⏳ Media counts *24 hours after posting*."
@@ -529,7 +545,6 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
-            # Top 3 by MEDIA, reactions as silent tiebreaker
             cursor.execute("""
                 SELECT user_id, username, media_count, react_count
                 FROM users
@@ -539,7 +554,6 @@ async def monthly_reset_internal():
             """, (chat_id,))
             top3 = cursor.fetchall()
 
-            # hall_of_fame schema expects total_count/text_count/media_count (NOT NULL)
             for idx, (user_id, username, media_c, _react_c) in enumerate(top3, start=1):
                 cursor.execute("""
                     INSERT OR REPLACE INTO hall_of_fame
@@ -547,7 +561,6 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, media_c, 0, media_c))
 
-            # Reset monthly media + reactions
             cursor.execute("""
                 UPDATE users
                 SET media_count = 0,
@@ -560,8 +573,7 @@ async def monthly_reset_internal():
 
 
 # ----------------------------
-# Unified leaderboard renderer (same style everywhere)
-# Top 5 only
+# Unified leaderboard renderer (same style everywhere) — Top 5 only
 # ----------------------------
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
@@ -666,14 +678,12 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = msg.from_user
     username = user.username or user.first_name or "Unknown"
 
-    # ✅ Only count media
     is_media = bool(msg.photo or msg.video or msg.document or msg.animation or msg.voice)
     if not is_media:
         return
 
     created_at_utc = int(time_mod.time())
 
-    # video detection for "top reacted video"
     is_video = bool(msg.video)
     if msg.document and (msg.document.mime_type or "").startswith("video/"):
         is_video = True
@@ -811,14 +821,14 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
         conn.commit()
 
-    group_id = DEFAULT_GROUP_CHAT_ID
+    group_id = await get_default_group_chat_id()
     if group_id:
         await update_group_leaderboard(context, group_id)
 
 
 async def monthly_reset_job(context: ContextTypes.DEFAULT_TYPE):
     await monthly_reset_internal()
-    group_id = DEFAULT_GROUP_CHAT_ID
+    group_id = await get_default_group_chat_id()
     if group_id:
         await update_group_leaderboard(context, group_id)
 
@@ -832,7 +842,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
-        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
+        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID (env) or run /setgroup in your group.")
         return
 
     args = [a.lower() for a in (context.args or [])]
@@ -875,7 +885,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
-        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
+        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID (env) or run /setgroup in your group.")
         return
 
     text = await render_stats(group_chat_id, update.effective_user.id)
@@ -913,7 +923,7 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
-        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
+        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID (env) or run /setgroup in your group.")
         return
 
     text = await render_hof(group_chat_id)
@@ -958,7 +968,7 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
-        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
+        await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID (env) or run /setgroup in your group.")
         return
 
     top = await get_top_reacted_video(group_chat_id)
@@ -973,7 +983,6 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent_ids: list[int] = []
 
-    # DM the actual message (copy preferred)
     dm_ok = False
     try:
         copied = await context.bot.copy_message(
@@ -1007,7 +1016,6 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_ids.append(summary.message_id)
         await store_extra_dm_messages(user.id, sent_ids)
 
-        # If command used in group, short notice
         if update.effective_chat and update.effective_chat.type != "private":
             try:
                 notice = await context.bot.send_message(update.effective_chat.id, "📩 Sent you the top video in DM.")
@@ -1027,6 +1035,77 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------
 # Group-only admin commands
 # ----------------------------
+async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin (group): set this group as the default group (stored in DB meta)."""
+    await safe_delete_message(update.message)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        try:
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    await set_meta(META_DEFAULT_GROUP_KEY, str(chat.id))
+
+    try:
+        msg = await context.bot.send_message(
+            chat.id,
+            f"✅ Default group set to this chat:\n`{chat.id}`\n\n(You can now use commands in DM.)",
+            parse_mode="Markdown",
+        )
+        schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+    except Exception:
+        pass
+
+
+async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin (group): reset stats for THIS group only."""
+    await safe_delete_message(update.message)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        try:
+            msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    chat_id = chat.id
+
+    async with db_lock:
+        cursor.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM reactions WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM message_reaction_totals WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM hall_of_fame WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM meta WHERE key = ?", (f"group_lb_msg_id:{chat_id}",))
+        conn.commit()
+
+    # recreate board
+    await update_group_leaderboard(context, chat_id)
+
+    try:
+        msg = await context.bot.send_message(chat.id, "✅ Reset stats for this group and refreshed the board.")
+        schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+    except Exception:
+        pass
+
+
 async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
@@ -1121,14 +1200,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ Delete the last "extra" DM messages whenever ANY button is pressed
     await delete_previous_extra_dm(context, query.from_user.id)
 
-    # Single-group
-    group_chat_id = DEFAULT_GROUP_CHAT_ID
+    group_chat_id = await get_default_group_chat_id()
     if not group_chat_id:
         group_chat_id = await get_user_last_chat(query.from_user.id)
 
     if not group_chat_id:
         await query.edit_message_text(
-            "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables (recommended).",
+            "❗ Set DEFAULT_GROUP_CHAT_ID (env) or run /setgroup in your group.",
             reply_markup=home_keyboard(),
         )
         return
@@ -1218,6 +1296,8 @@ async def post_init(app):
             BotCommand("help", "DM: show commands"),
             BotCommand("board", "Admin (group): create/refresh the permanent leaderboard board"),
             BotCommand("forceaward", "Admin (group): award pending media"),
+            BotCommand("setgroup", "Admin (group): set this group as default"),
+            BotCommand("resetstats", "Admin (group): reset stats for this group"),
         ])
     except Exception:
         pass
@@ -1254,6 +1334,8 @@ def main():
     # Group admin commands
     app.add_handler(CommandHandler("board", board))
     app.add_handler(CommandHandler("forceaward", forceaward))
+    app.add_handler(CommandHandler("setgroup", setgroup))
+    app.add_handler(CommandHandler("resetstats", resetstats))
 
     # Buttons (DM)
     app.add_handler(CallbackQueryHandler(on_button))
@@ -1266,12 +1348,13 @@ def main():
         day=1,
     )
 
-    # Create/refresh group board shortly after startup
-    if DEFAULT_GROUP_CHAT_ID:
-        async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
-            await update_group_leaderboard(ctx, DEFAULT_GROUP_CHAT_ID)
+    # Create/refresh group board shortly after startup (if default group known)
+    async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
+        gid = await get_default_group_chat_id()
+        if gid:
+            await update_group_leaderboard(ctx, gid)
 
-        app.job_queue.run_once(_startup_board, when=5)
+    app.job_queue.run_once(_startup_board, when=5)
 
     # IMPORTANT: request reaction updates
     app.run_polling(allowed_updates=Update.ALL_TYPES)
