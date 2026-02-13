@@ -30,7 +30,8 @@ TZ = ZoneInfo("America/Montreal")
 # Only the tiny group notice should auto-delete
 DM_NOTICE_SECONDS = 5
 
-DB_PATH = DB_PATH = os.getenv("DB_PATH", "/data/leaderboard.db")
+# ✅ Railway volume-safe default (mount your Volume at /data)
+DB_PATH = os.getenv("DB_PATH", "/data/leaderboard.db")
 
 
 def parse_int_env(name: str, default: int = 0) -> int:
@@ -204,6 +205,10 @@ def _set_meta_sync(key: str, value: str):
     """, (key, value))
 
 
+def _del_meta_sync(key: str):
+    cursor.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
 async def get_meta(key: str) -> str | None:
     async with db_lock:
         return _get_meta_sync(key)
@@ -212,6 +217,12 @@ async def get_meta(key: str) -> str | None:
 async def set_meta(key: str, value: str):
     async with db_lock:
         _set_meta_sync(key, value)
+        conn.commit()
+
+
+async def del_meta(key: str):
+    async with db_lock:
+        _del_meta_sync(key)
         conn.commit()
 
 
@@ -238,6 +249,52 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         context.job_queue.run_once(_delete_cb, when=delay_seconds)
     except Exception:
         pass
+
+
+# ----------------------------
+# DM cleanup: delete the last "extra" DM messages when a new button is pressed
+# (We only store messages like the copied top video + its summary, not the control panel message.)
+# ----------------------------
+def _last_extra_dm_key(user_id: int) -> str:
+    return f"last_extra_dm_msgs:{user_id}"
+
+
+async def delete_previous_extra_dm(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    key = _last_extra_dm_key(user_id)
+    async with db_lock:
+        raw = _get_meta_sync(key)
+
+    if not raw:
+        return
+
+    # raw is a comma-separated list of message_ids
+    ids: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            continue
+
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=mid)
+        except Exception:
+            pass
+
+    await del_meta(key)
+
+
+async def store_extra_dm_messages(user_id: int, message_ids: list[int]):
+    # Store comma-separated ids
+    key = _last_extra_dm_key(user_id)
+    payload = ",".join(str(m) for m in message_ids if m)
+    if not payload:
+        await del_meta(key)
+        return
+    await set_meta(key, payload)
 
 
 # ----------------------------
@@ -384,8 +441,8 @@ def help_text() -> str:
     return (
         "📌 *Leaderboard Bot — Command Center*\n\n"
         "*Leaderboards*\n"
-        "• `/leaderboard` — Monthly Top 10\n"
-        "• `/leaderboard all` — All-time Top 10\n\n"
+        "• `/leaderboard` — Monthly Top 5\n"
+        "• `/leaderboard all` — All-time Top 5\n\n"
         "*Stats*\n"
         "• `/stats` — Your totals\n\n"
         "*History*\n"
@@ -408,7 +465,7 @@ def rank_badge(i: int) -> str:
         return "🥈"
     if i == 3:
         return "🥉"
-    keycaps = {4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+    keycaps = {4: "4️⃣", 5: "5️⃣"}
     return keycaps.get(i, f"{i}.")
 
 
@@ -472,7 +529,7 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
-            # Top 3 by MEDIA, reactions tiebreaker (not displayed)
+            # Top 3 by MEDIA, reactions as silent tiebreaker
             cursor.execute("""
                 SELECT user_id, username, media_count, react_count
                 FROM users
@@ -504,7 +561,7 @@ async def monthly_reset_internal():
 
 # ----------------------------
 # Unified leaderboard renderer (same style everywhere)
-# Ranking uses reactions as tiebreaker, but UI does not mention it.
+# Top 5 only
 # ----------------------------
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
@@ -520,7 +577,7 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY all_media_count DESC, all_react_count DESC
-                LIMIT 10
+                LIMIT 5
             """, (chat_id,))
             rows = cursor.fetchall()
         else:
@@ -529,11 +586,11 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY media_count DESC, react_count DESC
-                LIMIT 10
+                LIMIT 5
             """, (chat_id,))
             rows = cursor.fetchall()
 
-    title = "🏆 *Leaderboard — All-Time (Top 10)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 10)*"
+    title = "🏆 *Leaderboard — All-Time (Top 5)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 5)*"
     subtitle = "_🖼 media • ❤️ reactions received_"
 
     if not rows:
@@ -595,8 +652,7 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
 
 # ----------------------------
-# Tracking messages (non-command only)
-# Only track MEDIA. (No "messages sent" / text stats.)
+# Tracking messages (non-command only) — media only
 # ----------------------------
 async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
@@ -912,35 +968,44 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mid, author, reacts = top
 
+    # Delete any previously sent "extra" DM messages (e.g., last top video + summary)
+    await delete_previous_extra_dm(context, user.id)
+
+    sent_ids: list[int] = []
+
     # DM the actual message (copy preferred)
     dm_ok = False
     try:
-        await context.bot.copy_message(
+        copied = await context.bot.copy_message(
             chat_id=user.id,
             from_chat_id=group_chat_id,
             message_id=mid,
         )
+        sent_ids.append(copied.message_id)
         dm_ok = True
     except Exception as e:
         print("copy_message failed, trying forward:", repr(e))
         try:
-            await context.bot.forward_message(
+            forwarded = await context.bot.forward_message(
                 chat_id=user.id,
                 from_chat_id=group_chat_id,
                 message_id=mid,
             )
+            sent_ids.append(forwarded.message_id)
             dm_ok = True
         except Exception as e2:
             print("forward_message failed:", repr(e2))
 
     if dm_ok:
-        await context.bot.send_message(
+        summary = await context.bot.send_message(
             chat_id=user.id,
             text=f"🎬 *Top reacted video*\n❤️ {reacts} reactions\n👤 @{author}",
             parse_mode="Markdown",
             disable_web_page_preview=True,
             reply_markup=secondary_keyboard(),
         )
+        sent_ids.append(summary.message_id)
+        await store_extra_dm_messages(user.id, sent_ids)
 
         # If command used in group, short notice
         if update.effective_chat and update.effective_chat.type != "private":
@@ -1053,6 +1118,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # ✅ Delete the last "extra" DM messages whenever ANY button is pressed
+    await delete_previous_extra_dm(context, query.from_user.id)
+
     # Single-group
     group_chat_id = DEFAULT_GROUP_CHAT_ID
     if not group_chat_id:
@@ -1089,27 +1157,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mid, author, reacts = top
 
+        sent_ids: list[int] = []
         sent = False
         try:
-            await context.bot.copy_message(
+            copied = await context.bot.copy_message(
                 chat_id=query.from_user.id,
                 from_chat_id=group_chat_id,
                 message_id=mid,
             )
+            sent_ids.append(copied.message_id)
             sent = True
         except Exception as e:
             print("copy_message failed in button, trying forward:", repr(e))
             try:
-                await context.bot.forward_message(
+                forwarded = await context.bot.forward_message(
                     chat_id=query.from_user.id,
                     from_chat_id=group_chat_id,
                     message_id=mid,
                 )
+                sent_ids.append(forwarded.message_id)
                 sent = True
             except Exception as e2:
                 print("forward_message failed in button:", repr(e2))
 
         if sent:
+            await store_extra_dm_messages(query.from_user.id, sent_ids)
             await query.edit_message_text(
                 f"✅ Sent the top reacted video!\n\n❤️ {reacts} reactions\n👤 @{author}",
                 reply_markup=secondary_keyboard(),
@@ -1139,7 +1211,7 @@ async def post_init(app):
     await ensure_month_is_current()
     try:
         await app.bot.set_my_commands([
-            BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
+            BotCommand("leaderboard", "DM: monthly leaderboard (Top 5; add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
             BotCommand("topvideo", "DM: most reacted video"),
