@@ -29,8 +29,7 @@ DB_PATH = "leaderboard.db"
 # Set in Railway Variables like: DEFAULT_GROUP_CHAT_ID = -1001234567890
 DEFAULT_GROUP_CHAT_ID = int(os.getenv("DEFAULT_GROUP_CHAT_ID", "0") or 0)
 
-# ✅ Temporary: auto-detect the first group chat_id the bot sees and store it in DB.
-# This auto-disables itself after the first detection.
+# ✅ Auto-detect first group chat_id and store in DB (one-time). Will announce once.
 AUTO_DETECT_GROUP_ID = True
 
 
@@ -61,7 +60,7 @@ CREATE TABLE IF NOT EXISTS users (
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS hall_of_fame (
     chat_id INTEGER NOT NULL,
-    month TEXT NOT NULL,       -- e.g. "2026-02" (month being honored / month that just ended)
+    month TEXT NOT NULL,       -- e.g. "2026-02" (month honored / month that just ended)
     rank INTEGER NOT NULL,     -- 1,2,3
     user_id INTEGER NOT NULL,
     username TEXT,
@@ -101,7 +100,6 @@ CREATE TABLE IF NOT EXISTS user_context (
 
 conn.commit()
 
-# Global DB lock (PTB runs handlers/jobs concurrently)
 db_lock = asyncio.Lock()
 
 
@@ -123,7 +121,7 @@ def ensure_all_time_columns():
 ensure_all_time_columns()
 
 
-# --- Meta helpers (sync + async wrapper) ---
+# --- Meta helpers ---
 def _get_meta_sync(key: str) -> str | None:
     cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
     row = cursor.fetchone()
@@ -327,7 +325,7 @@ def help_text() -> str:
     )
 
 
-# --- Rank badges (medals + keycaps) ---
+# --- Rank badges ---
 def rank_badge(i: int) -> str:
     if i == 1:
         return "🥇"
@@ -441,12 +439,8 @@ async def monthly_reset_internal():
         conn.commit()
 
 
-# --- Auto-detect group ID once (works even if bot only sees commands) ---
+# --- Auto-detect group ID once (announces once) ---
 async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Detect the first group/supergroup chat_id the bot sees, store in meta.primary_group_chat_id,
-    announce once, then disable itself automatically via meta.autodetect_done=1.
-    """
     if not AUTO_DETECT_GROUP_ID:
         return
 
@@ -455,21 +449,18 @@ async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAUL
         return
 
     if DEFAULT_GROUP_CHAT_ID:
-        # Env already pins the group; no need to autodetect.
         return
 
     done = await get_meta("autodetect_done")
     if done == "1":
         return
 
-    # Set primary group if missing
     primary = await get_meta("primary_group_chat_id")
     if not primary:
         await set_meta("primary_group_chat_id", str(chat.id))
 
     await set_meta("autodetect_done", "1")
 
-    # Log + notify once
     print("\n==============================")
     print("🚀 DETECTED GROUP CHAT ID:")
     print(chat.id)
@@ -494,6 +485,27 @@ async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAUL
 # --- Probe handler: runs for ALL messages (including commands) ---
 async def probe_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_autodetect_group_id(update, context)
+
+
+# --- NEW: Manual /chatid command (always shows ID, even if autodetect already ran) ---
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    # Log to Railway logs
+    print("\n==============================")
+    print("🚀 GROUP CHAT ID (manual):")
+    print(chat.id)
+    print("==============================\n")
+
+    msg = await context.bot.send_message(
+        chat.id,
+        f"🔎 *Chat ID*\n\n`{chat.id}`",
+        parse_mode="Markdown",
+    )
+    schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
 
 
 # --- Rendering helpers ---
@@ -600,7 +612,6 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
 
-    # Ignore stickers entirely
     if msg.sticker:
         return
 
@@ -702,12 +713,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Admin command: keep group feedback visible
     await safe_delete_message(update.message)
 
     chat = update.effective_chat
     user = update.effective_user
-
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         msg = await context.bot.send_message(chat.id, "❌ Admins only.")
@@ -760,7 +769,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # Determine group context for this user
     if DEFAULT_GROUP_CHAT_ID:
         group_chat_id = DEFAULT_GROUP_CHAT_ID
     else:
@@ -819,6 +827,7 @@ async def post_init(app):
             BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
+            BotCommand("chatid", "Show the current chat ID (debug)"),
             BotCommand("forceaward", "Admin: award pending messages"),
             BotCommand("help", "DM: show commands"),
         ])
@@ -838,20 +847,21 @@ def main():
         .build()
     )
 
-    # ✅ Probe runs for ALL messages (including commands), so group ID auto-detect works even with privacy mode ON
+    # ✅ Probe runs for ALL messages (including commands), so auto-detect can run even with privacy mode ON
     app.add_handler(MessageHandler(filters.ALL, probe_group), group=0)
 
     # ✅ Tracker ignores commands (so commands are not counted)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
-    # DM-only user commands
+    # Commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))  # alias
+    app.add_handler(CommandHandler("chatid", chatid))          # ✅ manual always-works ID command
 
-    # Admin command (group-visible)
+    # Admin
     app.add_handler(CommandHandler("forceaward", forceaward))
 
     # Buttons (DM)
