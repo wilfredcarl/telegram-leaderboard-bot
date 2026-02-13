@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS users (
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS hall_of_fame (
     chat_id INTEGER NOT NULL,
-    month TEXT NOT NULL,       -- e.g. "2026-02" (the month being honored / the month that just ended)
+    month TEXT NOT NULL,       -- e.g. "2026-02" (month being honored / month that just ended)
     rank INTEGER NOT NULL,     -- 1,2,3
     user_id INTEGER NOT NULL,
     username TEXT,
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS meta (
 )
 """)
 
-# Stores last group a user used a command in (useful for testing/multi-group)
+# Stores last group a user used a command in (useful in testing / multi-group)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS user_context (
     user_id INTEGER PRIMARY KEY,
@@ -123,7 +123,7 @@ def ensure_all_time_columns():
 ensure_all_time_columns()
 
 
-# --- Meta helpers ---
+# --- Meta helpers (sync + async wrapper) ---
 def _get_meta_sync(key: str) -> str | None:
     cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
     row = cursor.fetchone()
@@ -172,7 +172,7 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
-# --- DM-only sending ---
+# --- Context helpers (DM-only needs group context) ---
 async def save_user_context(user_id: int, chat_id: int):
     async with db_lock:
         cursor.execute("""
@@ -193,7 +193,7 @@ async def get_user_last_chat(user_id: int) -> int | None:
 async def resolve_group_chat_id(update: Update) -> int | None:
     """
     Resolve which group chat_id to use for stats:
-    1) DEFAULT_GROUP_CHAT_ID env var (production, recommended)
+    1) DEFAULT_GROUP_CHAT_ID env var (production)
     2) primary_group_chat_id stored in DB (auto-detected once)
     3) last group where user invoked a command (testing / multi-group)
     """
@@ -218,6 +218,7 @@ async def resolve_group_chat_id(update: Update) -> int | None:
     return await get_user_last_chat(user.id)
 
 
+# --- DM-only sending ---
 async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *,
                        parse_mode: str | None = None, reply_markup=None):
     """
@@ -245,7 +246,7 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     # Save user's last group context (useful during testing)
     await save_user_context(user.id, chat.id)
 
-    # If we haven't set a primary group yet (and env isn't set), set it once (auto-detect)
+    # If we haven't set a primary group yet (and env isn't set), set it once
     if not DEFAULT_GROUP_CHAT_ID:
         primary = await get_meta("primary_group_chat_id")
         if not primary:
@@ -326,7 +327,7 @@ def help_text() -> str:
     )
 
 
-# --- Rank badges (medals + keycaps for a cleaner “pro” feel) ---
+# --- Rank badges (medals + keycaps) ---
 def rank_badge(i: int) -> str:
     if i == 1:
         return "🥇"
@@ -440,6 +441,61 @@ async def monthly_reset_internal():
         conn.commit()
 
 
+# --- Auto-detect group ID once (works even if bot only sees commands) ---
+async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Detect the first group/supergroup chat_id the bot sees, store in meta.primary_group_chat_id,
+    announce once, then disable itself automatically via meta.autodetect_done=1.
+    """
+    if not AUTO_DETECT_GROUP_ID:
+        return
+
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    if DEFAULT_GROUP_CHAT_ID:
+        # Env already pins the group; no need to autodetect.
+        return
+
+    done = await get_meta("autodetect_done")
+    if done == "1":
+        return
+
+    # Set primary group if missing
+    primary = await get_meta("primary_group_chat_id")
+    if not primary:
+        await set_meta("primary_group_chat_id", str(chat.id))
+
+    await set_meta("autodetect_done", "1")
+
+    # Log + notify once
+    print("\n==============================")
+    print("🚀 DETECTED GROUP CHAT ID:")
+    print(chat.id)
+    print("==============================\n")
+
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "🔎 *Detected Group Chat ID*\n\n"
+                f"`{chat.id}`\n\n"
+                "✅ Saved for DM context.\n"
+                "You can also set `DEFAULT_GROUP_CHAT_ID` in Railway later.",
+            ),
+            parse_mode="Markdown",
+        )
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
+    except Exception:
+        pass
+
+
+# --- Probe handler: runs for ALL messages (including commands) ---
+async def probe_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_autodetect_group_id(update, context)
+
+
 # --- Rendering helpers ---
 async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
     async with db_lock:
@@ -537,62 +593,10 @@ async def render_hof(chat_id: int) -> str:
     return out
 
 
-# --- Auto-detect group ID once (for when you can't add @userinfobot) ---
-async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Detect the first group/supergroup chat_id the bot sees, store in meta.primary_group_chat_id,
-    announce once, then disable itself automatically via meta.autodetect_done=1.
-    """
-    if not AUTO_DETECT_GROUP_ID:
-        return
-
-    chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
-        return
-
-    if DEFAULT_GROUP_CHAT_ID:
-        # If env var is set, no need to autodetect.
-        return
-
-    done = await get_meta("autodetect_done")
-    if done == "1":
-        return
-
-    # Set primary group if missing
-    primary = await get_meta("primary_group_chat_id")
-    if not primary:
-        await set_meta("primary_group_chat_id", str(chat.id))
-
-    await set_meta("autodetect_done", "1")
-
-    # Log + notify once
-    print("\n==============================")
-    print("🚀 DETECTED GROUP CHAT ID:")
-    print(chat.id)
-    print("==============================\n")
-
-    try:
-        msg = await context.bot.send_message(
-            chat_id=chat.id,
-            text=(
-                "🔎 *Detected Group Chat ID*\n\n"
-                f"`{chat.id}`\n\n"
-                "✅ Saved for DM context.\n"
-                "You can also set `DEFAULT_GROUP_CHAT_ID` in Railway later.",
-            ),
-            parse_mode="Markdown",
-        )
-        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
-    except Exception:
-        pass
-
-
-# --- Message Handler ---
+# --- Message Handler (counts only non-command messages) ---
 async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
-
-    await maybe_autodetect_group_id(update, context)
 
     msg = update.message
 
@@ -698,7 +702,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Admin command: keep group feedback visible (recommended)
+    # Admin command: keep group feedback visible
     await safe_delete_message(update.message)
 
     chat = update.effective_chat
@@ -748,7 +752,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await ensure_month_is_current()
 
-    # Only operate inside DM
     if query.message.chat.type != "private":
         try:
             warn = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
@@ -835,7 +838,11 @@ def main():
         .build()
     )
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages))
+    # ✅ Probe runs for ALL messages (including commands), so group ID auto-detect works even with privacy mode ON
+    app.add_handler(MessageHandler(filters.ALL, probe_group), group=0)
+
+    # ✅ Tracker ignores commands (so commands are not counted)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
     # DM-only user commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
