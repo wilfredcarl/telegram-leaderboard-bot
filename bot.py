@@ -27,7 +27,6 @@ from telegram.ext import (
 TOKEN = os.getenv("TOKEN")
 TZ = ZoneInfo("America/Montreal")
 
-# Only the tiny group notice should auto-delete
 DM_NOTICE_SECONDS = 5
 
 # ✅ Railway volume-safe default (mount your Volume at /data)
@@ -45,8 +44,7 @@ def parse_int_env(name: str, default: int = 0) -> int:
         return default
 
 
-# Optional: if you set this env var, bot runs in "single fixed group" mode
-# DEFAULT_GROUP_CHAT_ID = -1001234567890
+# Optional: fixed single-group mode via env (overrides /setgroup)
 DEFAULT_GROUP_CHAT_ID_ENV = parse_int_env("DEFAULT_GROUP_CHAT_ID", 0)
 META_DEFAULT_GROUP_KEY = "default_group_chat_id"
 
@@ -269,10 +267,6 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
 
 
 def thread_id_from_update(update: Update | None) -> int | None:
-    """
-    If the command was typed inside a forum topic, this returns its message_thread_id.
-    If no topics, returns None.
-    """
     if not update:
         return None
     msg = getattr(update, "effective_message", None)
@@ -282,8 +276,24 @@ def thread_id_from_update(update: Update | None) -> int | None:
 
 
 # ----------------------------
+# Board meta pack/unpack (message_id + thread_id)
+# ----------------------------
+def _pack_board_meta(message_id: int, thread_id: int | None) -> str:
+    return f"{int(message_id)}:{'' if thread_id is None else int(thread_id)}"
+
+
+def _unpack_board_meta(value: str) -> tuple[int | None, int | None]:
+    try:
+        msg_part, thread_part = (value.split(":", 1) + [""])[:2]
+        msg_id = int(msg_part) if msg_part.strip() else None
+        thread_id = int(thread_part) if thread_part.strip() else None
+        return msg_id, thread_id
+    except Exception:
+        return None, None
+
+
+# ----------------------------
 # DM cleanup: delete the last "extra" DM messages when a new button is pressed
-# (We only store messages like the copied top video + its summary, not the control panel message.)
 # ----------------------------
 def _last_extra_dm_key(user_id: int) -> str:
     return f"last_extra_dm_msgs:{user_id}"
@@ -374,7 +384,6 @@ async def send_dm_only(
     if not chat or not user:
         return
 
-    # If already in private chat → just send DM (no auto-delete)
     if chat.type == "private":
         await context.bot.send_message(
             chat_id=chat.id,
@@ -385,13 +394,11 @@ async def send_dm_only(
         )
         return
 
-    # Save last group for this user
     try:
         await save_user_context(user.id, chat.id)
     except Exception as e:
         print("save_user_context failed:", repr(e))
 
-    # Try DM
     dm_ok = False
     try:
         await context.bot.send_message(
@@ -405,7 +412,6 @@ async def send_dm_only(
     except Exception as e:
         print("DM failed:", repr(e))
 
-    # Group notice (auto-delete) — ✅ in the same topic
     tid = thread_id_from_update(update)
     try:
         if dm_ok:
@@ -636,21 +642,40 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
 
 
 # ----------------------------
-# Permanent group leaderboard (single message that updates)
+# Permanent group leaderboard (single message that updates) — ✅ stays in the topic
 # ----------------------------
-async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def update_group_leaderboard(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    preferred_thread_id: int | None = None,
+):
     await ensure_month_is_current()
     text = await render_leaderboard(chat_id, show_all_time=False)
 
     key = group_board_key(chat_id)
     async with db_lock:
-        stored = _get_meta_sync(key)
+        stored_raw = _get_meta_sync(key)
 
-    if stored:
+    stored_msg_id, stored_thread_id = (None, None)
+    if stored_raw:
+        stored_msg_id, stored_thread_id = _unpack_board_meta(stored_raw)
+
+    # If /board is called in a different topic, move the board there
+    if stored_msg_id and preferred_thread_id is not None and stored_thread_id != preferred_thread_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(stored_msg_id))
+        except Exception:
+            pass
+        stored_msg_id = None
+        stored_thread_id = None
+
+    # Try edit existing
+    if stored_msg_id:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=int(stored),
+                message_id=int(stored_msg_id),
                 text=text,
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
@@ -658,22 +683,28 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             return
         except Exception as e:
             print("edit_group_leaderboard failed (will recreate):", repr(e))
+            stored_msg_id = None
+            stored_thread_id = None
 
+    # Create new message in the preferred topic
     try:
         msg = await context.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode="Markdown",
             disable_web_page_preview=True,
+            message_thread_id=preferred_thread_id,
         )
     except Exception as e:
         print("send_group_leaderboard failed:", repr(e))
         return
 
+    # Store message_id + thread_id
     async with db_lock:
-        _set_meta_sync(key, str(msg.message_id))
+        _set_meta_sync(key, _pack_board_meta(msg.message_id, preferred_thread_id))
         conn.commit()
 
+    # Try pin
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id, disable_notification=True)
     except Exception:
@@ -1032,7 +1063,6 @@ async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_ids.append(summary.message_id)
         await store_extra_dm_messages(user.id, sent_ids)
 
-        # Notice in the same topic where command was typed
         if update.effective_chat and update.effective_chat.type != "private":
             tid = thread_id_from_update(update)
             try:
@@ -1198,13 +1228,15 @@ async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    await update_group_leaderboard(context, chat.id)
+    # ✅ Create/refresh board in the SAME topic the command was typed in
+    tid = thread_id_from_update(update)
+    await update_group_leaderboard(context, chat.id, preferred_thread_id=tid)
 
     try:
         msg = await context.bot.send_message(
             chat.id,
             "📌 Leaderboard board created/updated.",
-            message_thread_id=thread_id_from_update(update),
+            message_thread_id=tid,
         )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
