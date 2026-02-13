@@ -30,7 +30,7 @@ TZ = ZoneInfo("America/Montreal")
 # Only the tiny group notice should auto-delete
 DM_NOTICE_SECONDS = 5
 
-DB_PATH = "leaderboard.db"
+DB_PATH = DB_PATH = os.getenv("DB_PATH", "/data/leaderboard.db")
 
 
 def parse_int_env(name: str, default: int = 0) -> int:
