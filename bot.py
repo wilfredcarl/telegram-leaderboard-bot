@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS user_context (
 )
 """)
 
-# ✅ NEW: permanent message store so reactions can be credited to the author
+# ✅ permanent message store so reactions can be credited to the author
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     chat_id INTEGER NOT NULL,
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS messages (
 )
 """)
 
-# ✅ NEW: track who reacted (so adds/removes don’t double count)
+# ✅ track who reacted (so adds/removes don’t double count)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reactions (
     chat_id INTEGER NOT NULL,
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS reactions (
 )
 """)
 
-# ✅ NEW: per-message reaction totals (for top reacted video)
+# ✅ per-message reaction totals (for top reacted video)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS message_reaction_totals (
     chat_id INTEGER NOT NULL,
@@ -166,7 +166,6 @@ def ensure_all_time_columns():
 
 ensure_all_time_columns()
 
-# ✅ NEW: ensure reaction columns on users
 def ensure_reaction_columns():
     cursor.execute("PRAGMA table_info(users)")
     cols = {row[1] for row in cursor.fetchall()}
@@ -469,7 +468,6 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, total_c, text_c, media_c))
 
-            # ✅ reset monthly counts incl reactions received
             cursor.execute("""
                 UPDATE users
                 SET text_count = 0, media_count = 0, total_count = 0,
@@ -487,17 +485,14 @@ async def monthly_reset_internal():
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
 
-def _fmt_name(username: str, width: int = 16) -> str:
-    name = (username or "Unknown").replace("\n", " ").strip()
-    if len(name) > width:
-        return name[: width - 1] + "…"
-    return name.ljust(width)
-
 async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
     """
-    Returns Markdown (monospace table).
-    ✅ Monthly view shows ONLY monthly stats (no all-time line).
+    ✅ Unified emoji style used EVERYWHERE:
+    - Monthly: monthly only
+    - All-time: all-time only
     """
+    await ensure_month_is_current()
+
     async with db_lock:
         if show_all_time:
             cursor.execute("""
@@ -518,33 +513,25 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             """, (chat_id,))
             rows = cursor.fetchall()
 
+    title = "🏆 *Leaderboard — All-Time (Top 10)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 10)*"
+    subtitle = "_📝 text • 🖼 media • 📊 total • ❤️ reactions received_"
+
     if not rows:
-        return "No data yet! (Messages count after 24h.)"
+        return f"{title}\n\nNo data yet! (Messages count after 24h.)"
 
-    title = "🏆 Leaderboard — All-Time (Top 10)" if show_all_time else "🏆 Leaderboard — This Month (Top 10)"
-
-    # Monospace table
-    lines = []
-    lines.append("```text")
-    lines.append(f"{'#':<2} {'User':<16} {'T':>4} {'M':>4} {'Tot':>5} {'❤️':>4}")
-    lines.append("-" * 37)
-
+    out = f"{title}\n{subtitle}\n\n"
     for i, (username, t, m, total, r) in enumerate(rows, start=1):
-        rank_col = f"{i:>2}"
-        name_col = _fmt_name(username, 16)
-        lines.append(f"{rank_col} {name_col} {t:>4} {m:>4} {total:>5} {r:>4}")
-
-    lines.append("```")
-
-    return f"{title}\n" + "\n".join(lines)
+        name = username or "Unknown"
+        out += (
+            f"{rank_badge(i)} *{name}*\n"
+            f"   📝 {t}  •  🖼 {m}  •  📊 {total}  •  ❤️ {r}\n\n"
+        )
+    return out.strip()
 
 async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """
-    Creates one permanent leaderboard message (and pins it if allowed),
-    then keeps editing that same message on updates.
-
     ✅ Matches Monthly button
-    ✅ Uses Markdown table formatting
+    ✅ Uses the same emoji style everywhere
     """
     await ensure_month_is_current()
     text = await render_leaderboard(chat_id, show_all_time=False)
@@ -553,7 +540,6 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     async with db_lock:
         stored = _get_meta_sync(key)
 
-    # Try edit existing
     if stored:
         try:
             await context.bot.edit_message_text(
@@ -567,7 +553,6 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         except Exception as e:
             print("edit_group_leaderboard failed (will recreate):", repr(e))
 
-    # Create new message
     try:
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -579,12 +564,10 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         print("send_group_leaderboard failed:", repr(e))
         return
 
-    # Store message_id
     async with db_lock:
         _set_meta_sync(key, str(msg.message_id))
         conn.commit()
 
-    # Try pin (optional)
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id, disable_notification=True)
     except Exception:
@@ -600,7 +583,6 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
 
-    # Ignore stickers entirely
     if msg.sticker:
         return
 
@@ -612,7 +594,6 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind = "media" if is_media else "text"
     created_at_utc = int(time_mod.time())
 
-    # ✅ video detection for "top reacted video"
     is_video = bool(msg.video)
     if msg.document and (msg.document.mime_type or "").startswith("video/"):
         is_video = True
@@ -624,7 +605,6 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
 
-        # ✅ NEW: permanent mapping for reaction attribution
         cursor.execute("""
             INSERT OR REPLACE INTO messages
             (chat_id, message_id, author_id, author_username, is_video, created_at_utc)
@@ -635,7 +615,7 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------
-# ✅ Reaction tracking
+# Reaction tracking
 # ----------------------------
 async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mr = getattr(update, "message_reaction", None)
@@ -862,7 +842,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
 
 
-# ✅ top reacted video (DM)
+# Top reacted video (DM)
 async def render_top_reacted_video(chat_id: int) -> str:
     async with db_lock:
         cursor.execute("""
@@ -940,7 +920,6 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to create/refresh the permanent leaderboard in the group."""
     await safe_delete_message(update.message)
 
     chat = update.effective_chat
@@ -979,7 +958,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await ensure_month_is_current()
 
-    # Buttons are meant for DM
     if query.message.chat.type != "private":
         try:
             msg = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
@@ -988,7 +966,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # Single-group
     group_chat_id = DEFAULT_GROUP_CHAT_ID
     if not group_chat_id:
         group_chat_id = await get_user_last_chat(query.from_user.id)
@@ -1066,13 +1043,9 @@ def main():
         .build()
     )
 
-    # Track ONLY non-command messages (so commands are not counted)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
-
-    # ✅ reactions
     app.add_handler(MessageReactionHandler(track_reactions), group=1)
 
-    # DM-only commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
@@ -1080,14 +1053,11 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("commands", help_command))
 
-    # Group admin commands
     app.add_handler(CommandHandler("board", board))
     app.add_handler(CommandHandler("forceaward", forceaward))
 
-    # Buttons (DM)
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Jobs
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
 
     app.job_queue.run_monthly(
@@ -1096,14 +1066,12 @@ def main():
         day=1,
     )
 
-    # Create/refresh group board shortly after startup (Context is available here)
     if DEFAULT_GROUP_CHAT_ID:
         async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
             await update_group_leaderboard(ctx, DEFAULT_GROUP_CHAT_ID)
 
         app.job_queue.run_once(_startup_board, when=5)
 
-    # ✅ request reaction updates
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
