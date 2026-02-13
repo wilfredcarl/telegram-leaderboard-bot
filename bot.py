@@ -32,6 +32,9 @@ DM_NOTICE_SECONDS = 5
 # ✅ Railway volume-safe default (mount your Volume at /data)
 DB_PATH = os.getenv("DB_PATH", "/data/leaderboard.db")
 
+# ✅ Leaderboard size (Top 10)
+LEADERBOARD_LIMIT = 10
+
 
 def parse_int_env(name: str, default: int = 0) -> int:
     raw = (os.getenv(name) or "").strip()
@@ -478,8 +481,8 @@ def help_text() -> str:
     return (
         "📌 *Leaderboard Bot — Command Center*\n\n"
         "*Leaderboards*\n"
-        "• `/leaderboard` — Monthly Top 5\n"
-        "• `/leaderboard all` — All-time Top 5\n\n"
+        f"• `/leaderboard` — Monthly Top {LEADERBOARD_LIMIT}\n"
+        f"• `/leaderboard all` — All-time Top {LEADERBOARD_LIMIT}\n\n"
         "*Stats*\n"
         "• `/stats` — Your totals\n\n"
         "*History*\n"
@@ -504,7 +507,9 @@ def rank_badge(i: int) -> str:
         return "🥈"
     if i == 3:
         return "🥉"
-    keycaps = {4: "4️⃣", 5: "5️⃣"}
+    keycaps = {
+        4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"
+    }
     return keycaps.get(i, f"{i}.")
 
 
@@ -596,7 +601,7 @@ async def monthly_reset_internal():
 
 
 # ----------------------------
-# Unified leaderboard renderer (same style everywhere) — Top 5 only
+# Unified leaderboard renderer (same style everywhere) — Top 10
 # ----------------------------
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
@@ -612,8 +617,8 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY all_media_count DESC, all_react_count DESC
-                LIMIT 5
-            """, (chat_id,))
+                LIMIT ?
+            """, (chat_id, LEADERBOARD_LIMIT))
             rows = cursor.fetchall()
         else:
             cursor.execute("""
@@ -621,11 +626,15 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
                 FROM users
                 WHERE chat_id = ?
                 ORDER BY media_count DESC, react_count DESC
-                LIMIT 5
-            """, (chat_id,))
+                LIMIT ?
+            """, (chat_id, LEADERBOARD_LIMIT))
             rows = cursor.fetchall()
 
-    title = "🏆 *Leaderboard — All-Time (Top 5)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 5)*"
+    title = (
+        f"🏆 *Leaderboard — All-Time (Top {LEADERBOARD_LIMIT})*"
+        if show_all_time
+        else f"🏆 *Leaderboard — This Month (Top {LEADERBOARD_LIMIT})*"
+    )
     subtitle = "_🖼 media • ❤️ reactions received_"
 
     if not rows:
@@ -1353,7 +1362,7 @@ async def post_init(app):
     await ensure_month_is_current()
     try:
         await app.bot.set_my_commands([
-            BotCommand("leaderboard", "DM: monthly leaderboard (Top 5; add 'all' for all-time)"),
+            BotCommand("leaderboard", f"DM: monthly leaderboard (Top {LEADERBOARD_LIMIT}; add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
             BotCommand("topvideo", "DM: most reacted video"),
