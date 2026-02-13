@@ -22,7 +22,10 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TOKEN")
 TZ = ZoneInfo("America/Montreal")
-AUTO_DELETE_SECONDS = 30
+
+# ⏱ For testing, keep notices visible longer
+AUTO_DELETE_SECONDS = 180  # change back to 30 later
+
 DB_PATH = "leaderboard.db"
 
 # ✅ Optional: hard-pin the bot to ONE group (recommended for production)
@@ -60,8 +63,8 @@ CREATE TABLE IF NOT EXISTS users (
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS hall_of_fame (
     chat_id INTEGER NOT NULL,
-    month TEXT NOT NULL,       -- e.g. "2026-02" (month honored / month that just ended)
-    rank INTEGER NOT NULL,     -- 1,2,3
+    month TEXT NOT NULL,
+    rank INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     username TEXT,
     total_count INTEGER NOT NULL,
@@ -77,8 +80,8 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     message_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     username TEXT,
-    kind TEXT NOT NULL,              -- 'text' or 'media'
-    created_at_utc INTEGER NOT NULL, -- unix timestamp
+    kind TEXT NOT NULL,
+    created_at_utc INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 )
 """)
@@ -90,7 +93,6 @@ CREATE TABLE IF NOT EXISTS meta (
 )
 """)
 
-# Stores last group a user used a command in (useful in testing / multi-group)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS user_context (
     user_id INTEGER PRIMARY KEY,
@@ -103,7 +105,6 @@ conn.commit()
 db_lock = asyncio.Lock()
 
 
-# --- DB migration helper (safe for existing DBs) ---
 def ensure_all_time_columns():
     cursor.execute("PRAGMA table_info(users)")
     columns = [row[1] for row in cursor.fetchall()]
@@ -170,7 +171,7 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         pass
 
 
-# --- Context helpers (DM-only needs group context) ---
+# --- Context helpers ---
 async def save_user_context(user_id: int, chat_id: int):
     async with db_lock:
         cursor.execute("""
@@ -189,12 +190,6 @@ async def get_user_last_chat(user_id: int) -> int | None:
 
 
 async def resolve_group_chat_id(update: Update) -> int | None:
-    """
-    Resolve which group chat_id to use for stats:
-    1) DEFAULT_GROUP_CHAT_ID env var (production)
-    2) primary_group_chat_id stored in DB (auto-detected once)
-    3) last group where user invoked a command (testing / multi-group)
-    """
     if DEFAULT_GROUP_CHAT_ID:
         return DEFAULT_GROUP_CHAT_ID
 
@@ -216,20 +211,15 @@ async def resolve_group_chat_id(update: Update) -> int | None:
     return await get_user_last_chat(user.id)
 
 
-# --- DM-only sending ---
+# --- DM-only sending (UPDATED: always tries to notify group + logs failures) ---
 async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *,
                        parse_mode: str | None = None, reply_markup=None):
-    """
-    DM-only behavior:
-    - In group: try DM user; post a short notice in group; auto-delete the notice.
-    - If DM fails (user hasn't started bot): post instructions in group; auto-delete.
-    - In private: send in private; optional auto-delete.
-    """
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
         return
 
+    # Private chat: respond normally
     if chat.type == "private":
         msg = await context.bot.send_message(
             chat_id=chat.id,
@@ -241,15 +231,23 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
-    # Save user's last group context (useful during testing)
-    await save_user_context(user.id, chat.id)
+    # Save user's last group context (testing)
+    try:
+        await save_user_context(user.id, chat.id)
+    except Exception as e:
+        print("save_user_context failed:", repr(e))
 
-    # If we haven't set a primary group yet (and env isn't set), set it once
+    # Ensure primary group is saved once (if env isn't set)
     if not DEFAULT_GROUP_CHAT_ID:
-        primary = await get_meta("primary_group_chat_id")
-        if not primary:
-            await set_meta("primary_group_chat_id", str(chat.id))
+        try:
+            primary = await get_meta("primary_group_chat_id")
+            if not primary:
+                await set_meta("primary_group_chat_id", str(chat.id))
+        except Exception as e:
+            print("primary_group_chat_id save failed:", repr(e))
 
+    # Try DM
+    dm_ok = False
     try:
         await context.bot.send_message(
             chat_id=user.id,
@@ -258,14 +256,22 @@ async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
-        notice = await context.bot.send_message(chat_id=chat.id, text="📩 Sent you a DM.")
+        dm_ok = True
+    except Exception as e:
+        print("DM failed:", repr(e))
+
+    # Always try to notify the group
+    try:
+        if dm_ok:
+            notice = await context.bot.send_message(chat_id=chat.id, text="📩 Sent you a DM.")
+        else:
+            notice = await context.bot.send_message(
+                chat_id=chat.id,
+                text="❗ I couldn't DM you. Please open my bot in private and press Start, then try again.",
+            )
         schedule_delete(context, chat.id, notice.message_id, AUTO_DELETE_SECONDS)
-    except Exception:
-        notice = await context.bot.send_message(
-            chat_id=chat.id,
-            text="❗ I couldn't DM you. Please open my bot in private and press Start, then try again.",
-        )
-        schedule_delete(context, chat.id, notice.message_id, AUTO_DELETE_SECONDS)
+    except Exception as e:
+        print("Group notice failed:", repr(e))
 
 
 # --- Professional UI Keyboards ---
@@ -325,7 +331,6 @@ def help_text() -> str:
     )
 
 
-# --- Rank badges ---
 def rank_badge(i: int) -> str:
     if i == 1:
         return "🥇"
@@ -439,73 +444,154 @@ async def monthly_reset_internal():
         conn.commit()
 
 
-# --- Auto-detect group ID once (announces once) ---
-async def maybe_autodetect_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTO_DETECT_GROUP_ID:
-        return
-
-    chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
-        return
-
-    if DEFAULT_GROUP_CHAT_ID:
-        return
-
-    done = await get_meta("autodetect_done")
-    if done == "1":
-        return
-
-    primary = await get_meta("primary_group_chat_id")
-    if not primary:
-        await set_meta("primary_group_chat_id", str(chat.id))
-
-    await set_meta("autodetect_done", "1")
-
-    print("\n==============================")
-    print("🚀 DETECTED GROUP CHAT ID:")
-    print(chat.id)
-    print("==============================\n")
-
-    try:
-        msg = await context.bot.send_message(
-            chat_id=chat.id,
-            text=(
-                "🔎 *Detected Group Chat ID*\n\n"
-                f"`{chat.id}`\n\n"
-                "✅ Saved for DM context.\n"
-                "You can also set `DEFAULT_GROUP_CHAT_ID` in Railway later.",
-            ),
-            parse_mode="Markdown",
-        )
-        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
-    except Exception:
-        pass
-
-
-# --- Probe handler: runs for ALL messages (including commands) ---
+# --- Probe handler (kept) ---
 async def probe_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await maybe_autodetect_group_id(update, context)
+    # keep placeholder for any probe logic
+    return
 
 
-# --- NEW: Manual /chatid command (always shows ID, even if autodetect already ran) ---
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Commands ---
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+    await ensure_month_is_current()
+
+    group_chat_id = await resolve_group_chat_id(update)
+    if not group_chat_id:
+        await send_dm_only(update, context, "❗ Run `/leaderboard` once in your group first.")
+        return
+
+    args = [a.lower() for a in (context.args or [])]
+    show_all_time = len(args) >= 1 and args[0] in ("all", "alltime", "lifetime")
+    view = "all" if show_all_time else "month"
+
+    text = await render_leaderboard(group_chat_id, show_all_time)
+    await send_dm_only(update, context, text, reply_markup=leaderboard_keyboard(view))
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+    await ensure_month_is_current()
+
+    group_chat_id = await resolve_group_chat_id(update)
+    if not group_chat_id:
+        await send_dm_only(update, context, "❗ Run `/stats` once in your group first.")
+        return
+
+    user = update.effective_user
+    text = await render_stats(group_chat_id, user.id)
+    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
+
+
+async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
+    group_chat_id = await resolve_group_chat_id(update)
+    if not group_chat_id:
+        await send_dm_only(update, context, "❗ Run `/hof` once in your group first.")
+        return
+
+    text = await render_hof(group_chat_id)
+    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+    await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
+
+
+async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
     chat = update.effective_chat
-    if not chat:
+    user = update.effective_user
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        msg = await context.bot.send_message(chat.id, "❌ Admins only.")
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
         return
 
-    # Log to Railway logs
-    print("\n==============================")
-    print("🚀 GROUP CHAT ID (manual):")
-    print(chat.id)
-    print("==============================\n")
+    await ensure_month_is_current()
 
-    msg = await context.bot.send_message(
-        chat.id,
-        f"🔎 *Chat ID*\n\n`{chat.id}`",
-        parse_mode="Markdown",
-    )
+    async with db_lock:
+        cursor.execute("""
+            SELECT user_id, MAX(username) as username, kind, COUNT(*)
+            FROM pending_messages
+            WHERE chat_id = ?
+            GROUP BY user_id, kind
+        """, (chat.id,))
+        rows = cursor.fetchall()
+
+    if not rows:
+        msg = await context.bot.send_message(chat.id, "No pending messages to award.")
+        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
+        return
+
+    total_awarded = 0
+    async with db_lock:
+        for user_id, username, kind, n in rows:
+            _award_count(chat.id, user_id, username, kind, n)
+            total_awarded += n
+
+        cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
+        conn.commit()
+
+    msg = await context.bot.send_message(chat.id, f"✅ Awarded {total_awarded} pending messages.")
     schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
+
+
+# --- Button Callback Handler (DM) ---
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+    await ensure_month_is_current()
+
+    if query.message.chat.type != "private":
+        try:
+            warn = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
+            schedule_delete(context, query.message.chat_id, warn.message_id, AUTO_DELETE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    group_chat_id = await resolve_group_chat_id(update)
+    if not group_chat_id:
+        await query.edit_message_text(
+            "❗ I don't know which group to use yet.\nRun `/leaderboard` inside your group first.",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    data = query.data or ""
+
+    try:
+        if data in ("nav:home", "nav:help"):
+            await query.edit_message_text(help_text(), reply_markup=home_keyboard(), parse_mode="Markdown")
+            return
+
+        if data == "lb:month":
+            text = await render_leaderboard(group_chat_id, show_all_time=False)
+            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
+            return
+
+        if data == "lb:all":
+            text = await render_leaderboard(group_chat_id, show_all_time=True)
+            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"))
+            return
+
+        if data == "nav:stats":
+            text = await render_stats(group_chat_id, query.from_user.id)
+            await query.edit_message_text(text, reply_markup=secondary_keyboard())
+            return
+
+        if data == "nav:hof":
+            text = await render_hof(group_chat_id)
+            await query.edit_message_text(text, reply_markup=secondary_keyboard())
+            return
+    except Exception:
+        pass
 
 
 # --- Rendering helpers ---
@@ -605,215 +691,7 @@ async def render_hof(chat_id: int) -> str:
     return out
 
 
-# --- Message Handler (counts only non-command messages) ---
-async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.from_user:
-        return
-
-    msg = update.message
-
-    if msg.sticker:
-        return
-
-    chat_id = update.effective_chat.id
-    user = msg.from_user
-    username = user.username or user.first_name or "Unknown"
-
-    is_media = bool(msg.photo or msg.video or msg.document or msg.animation or msg.voice)
-    kind = "media" if is_media else "text"
-    created_at_utc = int(time_mod.time())
-
-    async with db_lock:
-        cursor.execute("""
-            INSERT OR IGNORE INTO pending_messages
-            (chat_id, message_id, user_id, username, kind, created_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (chat_id, msg.message_id, user.id, username, kind, created_at_utc))
-        conn.commit()
-
-
-# --- Job: award matured pending messages (>= 24h old) ---
-async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
-    await ensure_month_is_current()
-
-    now = int(time_mod.time())
-    cutoff = now - 24 * 60 * 60
-
-    async with db_lock:
-        cursor.execute("""
-            SELECT chat_id, user_id, MAX(username) as username, kind, COUNT(*)
-            FROM pending_messages
-            WHERE created_at_utc <= ?
-            GROUP BY chat_id, user_id, kind
-        """, (cutoff,))
-        rows = cursor.fetchall()
-
-        if not rows:
-            return
-
-        for chat_id, user_id, username, kind, n in rows:
-            _award_count(chat_id, user_id, username, kind, n)
-
-        cursor.execute("DELETE FROM pending_messages WHERE created_at_utc <= ?", (cutoff,))
-        conn.commit()
-
-
-# --- Commands (DM-only) ---
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update.message)
-    await ensure_month_is_current()
-
-    group_chat_id = await resolve_group_chat_id(update)
-    if not group_chat_id:
-        await send_dm_only(
-            update, context,
-            "❗ I don't know which group to use yet.\n"
-            "Run `/leaderboard` once inside your group first.",
-            parse_mode="Markdown",
-        )
-        return
-
-    args = [a.lower() for a in (context.args or [])]
-    show_all_time = len(args) >= 1 and args[0] in ("all", "alltime", "lifetime")
-    view = "all" if show_all_time else "month"
-
-    text = await render_leaderboard(group_chat_id, show_all_time)
-    await send_dm_only(update, context, text, reply_markup=leaderboard_keyboard(view))
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update.message)
-    await ensure_month_is_current()
-
-    group_chat_id = await resolve_group_chat_id(update)
-    if not group_chat_id:
-        await send_dm_only(update, context, "❗ Run `/stats` once in your group first.")
-        return
-
-    user = update.effective_user
-    text = await render_stats(group_chat_id, user.id)
-    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
-
-
-async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update.message)
-
-    group_chat_id = await resolve_group_chat_id(update)
-    if not group_chat_id:
-        await send_dm_only(update, context, "❗ Run `/hof` once in your group first.")
-        return
-
-    text = await render_hof(group_chat_id)
-    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update.message)
-    await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
-
-
-async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_delete_message(update.message)
-
-    chat = update.effective_chat
-    user = update.effective_user
-    member = await chat.get_member(user.id)
-    if member.status not in ("administrator", "creator"):
-        msg = await context.bot.send_message(chat.id, "❌ Admins only.")
-        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
-        return
-
-    await ensure_month_is_current()
-
-    async with db_lock:
-        cursor.execute("""
-            SELECT user_id, MAX(username) as username, kind, COUNT(*)
-            FROM pending_messages
-            WHERE chat_id = ?
-            GROUP BY user_id, kind
-        """, (chat.id,))
-        rows = cursor.fetchall()
-
-    if not rows:
-        msg = await context.bot.send_message(chat.id, "No pending messages to award.")
-        schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
-        return
-
-    total_awarded = 0
-    async with db_lock:
-        for user_id, username, kind, n in rows:
-            _award_count(chat.id, user_id, username, kind, n)
-            total_awarded += n
-
-        cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (chat.id,))
-        conn.commit()
-
-    msg = await context.bot.send_message(chat.id, f"✅ Awarded {total_awarded} pending messages.")
-    schedule_delete(context, chat.id, msg.message_id, AUTO_DELETE_SECONDS)
-
-
-# --- Button Callback Handler (buttons live in DM) ---
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query or not query.message:
-        return
-
-    await query.answer()
-    await ensure_month_is_current()
-
-    if query.message.chat.type != "private":
-        try:
-            warn = await context.bot.send_message(chat_id=query.message.chat_id, text="📩 Please use the DM I sent you.")
-            schedule_delete(context, query.message.chat_id, warn.message_id, AUTO_DELETE_SECONDS)
-        except Exception:
-            pass
-        return
-
-    if DEFAULT_GROUP_CHAT_ID:
-        group_chat_id = DEFAULT_GROUP_CHAT_ID
-    else:
-        primary = await get_meta("primary_group_chat_id")
-        group_chat_id = int(primary) if primary else await get_user_last_chat(query.from_user.id)
-
-    if not group_chat_id:
-        await query.edit_message_text(
-            "❗ I don't know which group to use yet.\nRun `/leaderboard` inside your group first.",
-            reply_markup=home_keyboard(),
-        )
-        return
-
-    data = query.data or ""
-
-    try:
-        if data in ("nav:home", "nav:help"):
-            await query.edit_message_text(help_text(), reply_markup=home_keyboard(), parse_mode="Markdown")
-            return
-
-        if data == "lb:month":
-            text = await render_leaderboard(group_chat_id, show_all_time=False)
-            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("month"))
-            return
-
-        if data == "lb:all":
-            text = await render_leaderboard(group_chat_id, show_all_time=True)
-            await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"))
-            return
-
-        if data == "nav:stats":
-            text = await render_stats(group_chat_id, query.from_user.id)
-            await query.edit_message_text(text, reply_markup=secondary_keyboard())
-            return
-
-        if data == "nav:hof":
-            text = await render_hof(group_chat_id)
-            await query.edit_message_text(text, reply_markup=secondary_keyboard())
-            return
-
-    except Exception:
-        pass
-
-
-# --- Monthly Reset Job (scheduled) ---
+# --- Monthly Reset Job ---
 async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
     await monthly_reset_internal()
 
@@ -821,13 +699,11 @@ async def monthly_reset(context: ContextTypes.DEFAULT_TYPE):
 # --- App lifecycle ---
 async def post_init(app):
     await ensure_month_is_current()
-
     try:
         await app.bot.set_my_commands([
             BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
-            BotCommand("chatid", "Show the current chat ID (debug)"),
             BotCommand("forceaward", "Admin: award pending messages"),
             BotCommand("help", "DM: show commands"),
         ])
@@ -847,30 +723,21 @@ def main():
         .build()
     )
 
-    # ✅ Probe runs for ALL messages (including commands), so auto-detect can run even with privacy mode ON
-    app.add_handler(MessageHandler(filters.ALL, probe_group), group=0)
-
     # ✅ Tracker ignores commands (so commands are not counted)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
-    # Commands
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("hof", hof))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("commands", help_command))  # alias
-    app.add_handler(CommandHandler("chatid", chatid))          # ✅ manual always-works ID command
+    app.add_handler(CommandHandler("commands", help_command))
 
-    # Admin
     app.add_handler(CommandHandler("forceaward", forceaward))
 
-    # Buttons (DM)
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Award matured messages every hour (counts messages once they are 24h old)
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
 
-    # Monthly reset: 1st at 00:05 Montreal time
     app.job_queue.run_monthly(
         monthly_reset,
         when=time(hour=0, minute=5, tzinfo=TZ),
