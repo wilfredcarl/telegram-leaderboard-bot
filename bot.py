@@ -32,6 +32,7 @@ DM_NOTICE_SECONDS = 5
 
 DB_PATH = "leaderboard.db"
 
+
 def parse_int_env(name: str, default: int = 0) -> int:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -41,6 +42,7 @@ def parse_int_env(name: str, default: int = 0) -> int:
     except ValueError:
         print(f"⚠️ Invalid {name} env value: {raw!r}. Using {default}.")
         return default
+
 
 # ✅ Recommended: set this in Railway Variables to your single group
 # DEFAULT_GROUP_CHAT_ID = -1001234567890
@@ -151,6 +153,7 @@ CREATE TABLE IF NOT EXISTS message_reaction_totals (
 
 conn.commit()
 
+
 def ensure_all_time_columns():
     cursor.execute("PRAGMA table_info(users)")
     cols = {row[1] for row in cursor.fetchall()}
@@ -164,7 +167,9 @@ def ensure_all_time_columns():
             cursor.execute(stmt)
     conn.commit()
 
+
 ensure_all_time_columns()
+
 
 def ensure_reaction_columns():
     cursor.execute("PRAGMA table_info(users)")
@@ -178,6 +183,7 @@ def ensure_reaction_columns():
             cursor.execute(stmt)
     conn.commit()
 
+
 ensure_reaction_columns()
 
 
@@ -189,6 +195,7 @@ def _get_meta_sync(key: str) -> str | None:
     row = cursor.fetchone()
     return row[0] if row else None
 
+
 def _set_meta_sync(key: str, value: str):
     cursor.execute("""
         INSERT INTO meta (key, value)
@@ -196,9 +203,11 @@ def _set_meta_sync(key: str, value: str):
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
     """, (key, value))
 
+
 async def get_meta(key: str) -> str | None:
     async with db_lock:
         return _get_meta_sync(key)
+
 
 async def set_meta(key: str, value: str):
     async with db_lock:
@@ -217,12 +226,14 @@ async def safe_delete_message(message):
     except Exception:
         pass
 
+
 def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_seconds: int):
     async def _delete_cb(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception:
             pass
+
     try:
         context.job_queue.run_once(_delete_cb, when=delay_seconds)
     except Exception:
@@ -241,11 +252,13 @@ async def save_user_context(user_id: int, chat_id: int):
         """, (user_id, chat_id))
         conn.commit()
 
+
 async def get_user_last_chat(user_id: int) -> int | None:
     async with db_lock:
         cursor.execute("SELECT last_chat_id FROM user_context WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         return row[0] if row else None
+
 
 async def resolve_group_chat_id(update: Update | None) -> int | None:
     # single-group mode
@@ -264,8 +277,14 @@ async def resolve_group_chat_id(update: Update | None) -> int | None:
 # ----------------------------
 # DM-only sending (group notice 5s)
 # ----------------------------
-async def send_dm_only(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *,
-                       parse_mode: str | None = None, reply_markup=None):
+async def send_dm_only(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup=None,
+):
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
@@ -326,23 +345,29 @@ def home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🕰 All-Time", callback_data="lb:all"),
         ],
         [
+            InlineKeyboardButton("🎬 Top Video", callback_data="nav:topvideo"),
+        ],
+        [
             InlineKeyboardButton("📊 My Stats", callback_data="nav:stats"),
             InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof"),
         ],
         [InlineKeyboardButton("ℹ️ Help", callback_data="nav:help")],
     ])
 
+
 def leaderboard_keyboard(view: str) -> InlineKeyboardMarkup:
     switch = InlineKeyboardButton("🏆 View Monthly", callback_data="lb:month") if view == "all" \
         else InlineKeyboardButton("🕰 View All-Time", callback_data="lb:all")
     return InlineKeyboardMarkup([
         [switch],
+        [InlineKeyboardButton("🎬 Top Video", callback_data="nav:topvideo")],
         [
             InlineKeyboardButton("📊 My Stats", callback_data="nav:stats"),
             InlineKeyboardButton("🏅 Hall of Fame", callback_data="nav:hof"),
         ],
         [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
     ])
+
 
 def secondary_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -350,8 +375,10 @@ def secondary_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏆 Monthly", callback_data="lb:month"),
             InlineKeyboardButton("🕰 All-Time", callback_data="lb:all"),
         ],
+        [InlineKeyboardButton("🎬 Top Video", callback_data="nav:topvideo")],
         [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
     ])
+
 
 def help_text() -> str:
     return (
@@ -365,13 +392,14 @@ def help_text() -> str:
         "• `/hof` — Hall of Fame (Top 3 each month)\n\n"
         "*Reactions*\n"
         "• ❤️ counted as *reactions received* on your media\n"
-        "• `/topvideo` — Top reacted video (DM)\n\n"
+        "• `/topvideo` — DM the most reacted video\n\n"
         "*Group Board*\n"
         "• `/board` — Create/refresh the permanent group leaderboard (admin)\n\n"
         "*Admin*\n"
         "• `/forceaward` — Award pending media\n\n"
         "⏳ Media counts *24 hours after posting*."
     )
+
 
 def rank_badge(i: int) -> str:
     if i == 1:
@@ -400,6 +428,7 @@ def _ensure_user_row(chat_id: int, user_id: int, username: str):
             VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
         """, (chat_id, user_id, username))
 
+
 def _award_media(chat_id: int, user_id: int, username: str, n: int):
     _ensure_user_row(chat_id, user_id, username)
     cursor.execute("""
@@ -410,13 +439,16 @@ def _award_media(chat_id: int, user_id: int, username: str, n: int):
         WHERE chat_id = ? AND user_id = ?
     """, (n, n, username, chat_id, user_id))
 
+
 def _current_month_key() -> str:
     return datetime.now(TZ).strftime("%Y-%m")
+
 
 def _previous_month_key() -> str:
     now = datetime.now(TZ)
     prev_month_day = now.replace(day=1) - timedelta(days=1)
     return prev_month_day.strftime("%Y-%m")
+
 
 async def ensure_month_is_current():
     current_month = _current_month_key()
@@ -430,6 +462,7 @@ async def ensure_month_is_current():
             return
     await monthly_reset_internal()
 
+
 async def monthly_reset_internal():
     honor_month = _previous_month_key()
     new_month = _current_month_key()
@@ -439,7 +472,7 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
-            # Top 3 by MEDIA, with reactions as tiebreaker
+            # Top 3 by MEDIA, reactions tiebreaker (not displayed)
             cursor.execute("""
                 SELECT user_id, username, media_count, react_count
                 FROM users
@@ -450,7 +483,6 @@ async def monthly_reset_internal():
             top3 = cursor.fetchall()
 
             # hall_of_fame schema expects total_count/text_count/media_count (NOT NULL)
-            # We'll store media as "total_count" too, and 0 for text_count.
             for idx, (user_id, username, media_c, _react_c) in enumerate(top3, start=1):
                 cursor.execute("""
                     INSERT OR REPLACE INTO hall_of_fame
@@ -458,7 +490,7 @@ async def monthly_reset_internal():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (chat_id, honor_month, idx, user_id, username, media_c, 0, media_c))
 
-            # Reset monthly media + reactions (leave old columns alone but unused)
+            # Reset monthly media + reactions
             cursor.execute("""
                 UPDATE users
                 SET media_count = 0,
@@ -472,10 +504,11 @@ async def monthly_reset_internal():
 
 # ----------------------------
 # Unified leaderboard renderer (same style everywhere)
-# Ranking: media desc, reactions desc (tiebreaker)
+# Ranking uses reactions as tiebreaker, but UI does not mention it.
 # ----------------------------
 def group_board_key(chat_id: int) -> str:
     return f"group_lb_msg_id:{chat_id}"
+
 
 async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
     await ensure_month_is_current()
@@ -501,7 +534,7 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             rows = cursor.fetchall()
 
     title = "🏆 *Leaderboard — All-Time (Top 10)*" if show_all_time else "🏆 *Leaderboard — This Month (Top 10)*"
-    subtitle = "_🖼 media • ❤️ reactions received (tiebreaker)_"
+    subtitle = "_🖼 media • ❤️ reactions received_"
 
     if not rows:
         return f"{title}\n\nNo data yet! (Media counts after 24h.)"
@@ -563,7 +596,7 @@ async def update_group_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
 # ----------------------------
 # Tracking messages (non-command only)
-# Only track MEDIA. (No "messages sent" / text stats at all.)
+# Only track MEDIA. (No "messages sent" / text stats.)
 # ----------------------------
 async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
@@ -641,7 +674,6 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (chat_id, message_id))
         row = cursor.fetchone()
         if not row:
-            # bot didn’t see the original media message -> can’t attribute
             return
 
         author_id, author_username = row
@@ -727,6 +759,7 @@ async def award_matured_messages(context: ContextTypes.DEFAULT_TYPE):
     if group_id:
         await update_group_leaderboard(context, group_id)
 
+
 async def monthly_reset_job(context: ContextTypes.DEFAULT_TYPE):
     await monthly_reset_internal()
     group_id = DEFAULT_GROUP_CHAT_ID
@@ -753,6 +786,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await render_leaderboard(group_chat_id, show_all_time)
     await send_dm_only(update, context, text, parse_mode="Markdown", reply_markup=leaderboard_keyboard(view))
 
+
 async def render_stats(chat_id: int, user_id: int) -> str:
     async with db_lock:
         cursor.execute("""
@@ -778,6 +812,7 @@ async def render_stats(chat_id: int, user_id: int) -> str:
         "⏳ Media is awarded after 24 hours."
     )
 
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
     await ensure_month_is_current()
@@ -789,6 +824,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = await render_stats(group_chat_id, update.effective_user.id)
     await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
+
 
 async def render_hof(chat_id: int) -> str:
     async with db_lock:
@@ -815,6 +851,7 @@ async def render_hof(chat_id: int) -> str:
             out += "\n"
     return out
 
+
 async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
@@ -826,15 +863,16 @@ async def hof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await render_hof(group_chat_id)
     await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
     await send_dm_only(update, context, help_text(), parse_mode="Markdown", reply_markup=home_keyboard())
 
 
 # ----------------------------
-# Top reacted video (DM)
+# Top reacted video (DM + button)
 # ----------------------------
-async def render_top_reacted_video(chat_id: int) -> str:
+async def get_top_reacted_video(chat_id: int):
     async with db_lock:
         cursor.execute("""
             SELECT m.message_id,
@@ -850,20 +888,75 @@ async def render_top_reacted_video(chat_id: int) -> str:
         row = cursor.fetchone()
 
     if not row:
-        return "🎬 Top reacted video: none yet."
+        return None
     mid, author, reacts = row
-    return f"🎬 Top reacted video: message_id={mid} by @{author} — ❤️ {reacts} reactions"
+    return int(mid), str(author), int(reacts)
+
 
 async def topvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
+
+    user = update.effective_user
+    if not user:
+        return
 
     group_chat_id = await resolve_group_chat_id(update)
     if not group_chat_id:
         await send_dm_only(update, context, "❗ Set DEFAULT_GROUP_CHAT_ID in Railway variables.")
         return
 
-    text = await render_top_reacted_video(group_chat_id)
-    await send_dm_only(update, context, text, reply_markup=secondary_keyboard())
+    top = await get_top_reacted_video(group_chat_id)
+    if not top:
+        await send_dm_only(update, context, "🎬 No reacted videos found yet.", reply_markup=secondary_keyboard())
+        return
+
+    mid, author, reacts = top
+
+    # DM the actual message (copy preferred)
+    dm_ok = False
+    try:
+        await context.bot.copy_message(
+            chat_id=user.id,
+            from_chat_id=group_chat_id,
+            message_id=mid,
+        )
+        dm_ok = True
+    except Exception as e:
+        print("copy_message failed, trying forward:", repr(e))
+        try:
+            await context.bot.forward_message(
+                chat_id=user.id,
+                from_chat_id=group_chat_id,
+                message_id=mid,
+            )
+            dm_ok = True
+        except Exception as e2:
+            print("forward_message failed:", repr(e2))
+
+    if dm_ok:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"🎬 *Top reacted video*\n❤️ {reacts} reactions\n👤 @{author}",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=secondary_keyboard(),
+        )
+
+        # If command used in group, short notice
+        if update.effective_chat and update.effective_chat.type != "private":
+            try:
+                notice = await context.bot.send_message(update.effective_chat.id, "📩 Sent you the top video in DM.")
+                schedule_delete(context, update.effective_chat.id, notice.message_id, DM_NOTICE_SECONDS)
+            except Exception:
+                pass
+        return
+
+    await send_dm_only(
+        update,
+        context,
+        "❗ I couldn't DM you the video. Please open the bot in private and press Start, then try again.",
+        reply_markup=secondary_keyboard(),
+    )
 
 
 # ----------------------------
@@ -910,6 +1003,7 @@ async def forceaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
     except Exception:
         pass
+
 
 async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
@@ -959,6 +1053,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # Single-group
     group_chat_id = DEFAULT_GROUP_CHAT_ID
     if not group_chat_id:
         group_chat_id = await get_user_last_chat(query.from_user.id)
@@ -986,6 +1081,46 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=leaderboard_keyboard("all"), parse_mode="Markdown")
         return
 
+    if data == "nav:topvideo":
+        top = await get_top_reacted_video(group_chat_id)
+        if not top:
+            await query.edit_message_text("🎬 No reacted videos found yet.", reply_markup=secondary_keyboard())
+            return
+
+        mid, author, reacts = top
+
+        sent = False
+        try:
+            await context.bot.copy_message(
+                chat_id=query.from_user.id,
+                from_chat_id=group_chat_id,
+                message_id=mid,
+            )
+            sent = True
+        except Exception as e:
+            print("copy_message failed in button, trying forward:", repr(e))
+            try:
+                await context.bot.forward_message(
+                    chat_id=query.from_user.id,
+                    from_chat_id=group_chat_id,
+                    message_id=mid,
+                )
+                sent = True
+            except Exception as e2:
+                print("forward_message failed in button:", repr(e2))
+
+        if sent:
+            await query.edit_message_text(
+                f"✅ Sent the top reacted video!\n\n❤️ {reacts} reactions\n👤 @{author}",
+                reply_markup=secondary_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                "❗ I couldn't DM the video. Please open the bot in private and press Start, then try again.",
+                reply_markup=secondary_keyboard(),
+            )
+        return
+
     if data == "nav:stats":
         text = await render_stats(group_chat_id, query.from_user.id)
         await query.edit_message_text(text, reply_markup=secondary_keyboard())
@@ -1007,20 +1142,13 @@ async def post_init(app):
             BotCommand("leaderboard", "DM: monthly leaderboard (add 'all' for all-time)"),
             BotCommand("stats", "DM: your stats"),
             BotCommand("hof", "DM: hall of fame"),
-            BotCommand("topvideo", "DM: top reacted video"),
+            BotCommand("topvideo", "DM: most reacted video"),
             BotCommand("help", "DM: show commands"),
             BotCommand("board", "Admin (group): create/refresh the permanent leaderboard board"),
             BotCommand("forceaward", "Admin (group): award pending media"),
         ])
     except Exception:
         pass
-
-    # If you set DEFAULT_GROUP_CHAT_ID, create/update the permanent board on startup
-    if DEFAULT_GROUP_CHAT_ID:
-        try:
-            await update_group_leaderboard(app.bot, DEFAULT_GROUP_CHAT_ID)  # (won't work: needs ContextTypes)
-        except Exception:
-            pass
 
 
 # ----------------------------
@@ -1037,10 +1165,10 @@ def main():
         .build()
     )
 
-    # Track ONLY non-command messages (media only inside handler)
+    # Track ONLY non-command messages (handler only records media)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_messages), group=1)
 
-    # Reactions (PTB 20.8+, recommended 22.6)
+    # Reactions
     app.add_handler(MessageReactionHandler(track_reactions), group=1)
 
     # DM-only commands
@@ -1060,17 +1188,17 @@ def main():
 
     # Jobs
     app.job_queue.run_repeating(award_matured_messages, interval=60 * 60, first=30)
-
     app.job_queue.run_monthly(
         monthly_reset_job,
         when=time(hour=0, minute=5, tzinfo=TZ),
         day=1,
     )
 
-    # Create/refresh group board shortly after startup (Context is available here)
+    # Create/refresh group board shortly after startup
     if DEFAULT_GROUP_CHAT_ID:
         async def _startup_board(ctx: ContextTypes.DEFAULT_TYPE):
             await update_group_leaderboard(ctx, DEFAULT_GROUP_CHAT_ID)
+
         app.job_queue.run_once(_startup_board, when=5)
 
     # IMPORTANT: request reaction updates
