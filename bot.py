@@ -573,21 +573,23 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
+            # ✅ CHANGED: snapshot Top 3 by reactions first (then media)
             cursor.execute("""
                 SELECT user_id, username, media_count, react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY media_count DESC, react_count DESC
+                ORDER BY react_count DESC, media_count DESC
                 LIMIT 3
             """, (chat_id,))
             top3 = cursor.fetchall()
 
-            for idx, (user_id, username, media_c, _react_c) in enumerate(top3, start=1):
+            # ✅ CHANGED: store reactions as hall_of_fame.total_count
+            for idx, (user_id, username, media_c, react_c) in enumerate(top3, start=1):
                 cursor.execute("""
                     INSERT OR REPLACE INTO hall_of_fame
                     (chat_id, month, rank, user_id, username, total_count, text_count, media_count)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (chat_id, honor_month, idx, user_id, username, media_c, 0, media_c))
+                """, (chat_id, honor_month, idx, user_id, username, react_c, 0, media_c))
 
             cursor.execute("""
                 UPDATE users
@@ -612,20 +614,22 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
 
     async with db_lock:
         if show_all_time:
+            # ✅ CHANGED: sort by reactions first (then media)
             cursor.execute("""
                 SELECT username, all_media_count, all_react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY all_media_count DESC, all_react_count DESC
+                ORDER BY all_react_count DESC, all_media_count DESC
                 LIMIT ?
             """, (chat_id, LEADERBOARD_LIMIT))
             rows = cursor.fetchall()
         else:
+            # ✅ CHANGED: sort by reactions first (then media)
             cursor.execute("""
                 SELECT username, media_count, react_count
                 FROM users
                 WHERE chat_id = ?
-                ORDER BY media_count DESC, react_count DESC
+                ORDER BY react_count DESC, media_count DESC
                 LIMIT ?
             """, (chat_id, LEADERBOARD_LIMIT))
             rows = cursor.fetchall()
@@ -635,7 +639,9 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
         if show_all_time
         else f"🏆 *Leaderboard — This Month (Top {LEADERBOARD_LIMIT})*"
     )
-    subtitle = "_🖼 media • ❤️ reactions received_"
+
+    # ✅ (optional but consistent) clarify primary ranking
+    subtitle = "_❤️ reactions received • 🖼 media (tiebreaker)_"
 
     if not rows:
         return f"{title}\n\nNo data yet! (Media counts after 24h.)"
@@ -645,7 +651,7 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
         name = username or "Unknown"
         out += (
             f"{rank_badge(i)} *{name}*\n"
-            f"   🖼 {media_c}  •  ❤️ {react_c}\n\n"
+            f"   ❤️ {react_c}  •  🖼 {media_c}\n\n"
         )
     return out.strip()
 
@@ -951,8 +957,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def render_hof(chat_id: int) -> str:
     async with db_lock:
+        # ✅ CHANGED: include total_count (reactions score) + media_count
         cursor.execute("""
-            SELECT month, rank, username, media_count
+            SELECT month, rank, username, total_count, media_count
             FROM hall_of_fame
             WHERE chat_id = ?
             ORDER BY month DESC, rank ASC
@@ -965,11 +972,12 @@ async def render_hof(chat_id: int) -> str:
 
     out = "🏅 Hall of Fame — Top 3 per Month\n\n"
     current = None
-    for month, rank, username, media_c in rows:
+    for month, rank, username, reacts, media_c in rows:
         if month != current:
             current = month
             out += f"📅 {month}\n"
-        out += f"  {rank_badge(rank)} {username} — 🖼 {media_c}\n"
+        # ✅ CHANGED: show reactions as primary score
+        out += f"  {rank_badge(rank)} {username} — ❤️ {reacts}  •  🖼 {media_c}\n"
         if rank == 3:
             out += "\n"
     return out
