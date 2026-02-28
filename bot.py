@@ -154,6 +154,15 @@ CREATE TABLE IF NOT EXISTS message_reaction_totals (
 )
 """)
 
+# ✅ users excluded from Hall of Fame (per group)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS hof_excluded (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+)
+""")
+
 conn.commit()
 
 
@@ -494,6 +503,9 @@ def help_text() -> str:
         "• `/board` — Create/refresh the permanent group leaderboard (admin)\n"
         "• `/setgroup` — Set this group as the default group (admin)\n"
         "• `/resetstats` — Reset stats for this group (admin)\n\n"
+        "*Hall of Fame Admin*\n"
+        "• `/excludehof` — Exclude a user from Hall of Fame eligibility (admin)\n"
+        "• `/includehof` — Re-include a user for Hall of Fame eligibility (admin)\n\n"
         "*Admin*\n"
         "• `/forceaward` — Award pending media\n\n"
         "⏳ Media counts *24 hours after posting*."
@@ -573,17 +585,20 @@ async def monthly_reset_internal():
         chat_ids = [row[0] for row in cursor.fetchall()]
 
         for chat_id in chat_ids:
-            # ✅ CHANGED: snapshot Top 3 by reactions first (then media)
+            # ✅ snapshot Top 3 by reactions first (then media), excluding hof_excluded
             cursor.execute("""
-                SELECT user_id, username, media_count, react_count
-                FROM users
-                WHERE chat_id = ?
-                ORDER BY react_count DESC, media_count DESC
+                SELECT u.user_id, u.username, u.media_count, u.react_count
+                FROM users u
+                LEFT JOIN hof_excluded e
+                  ON e.chat_id = u.chat_id AND e.user_id = u.user_id
+                WHERE u.chat_id = ?
+                  AND e.user_id IS NULL
+                ORDER BY u.react_count DESC, u.media_count DESC
                 LIMIT 3
             """, (chat_id,))
             top3 = cursor.fetchall()
 
-            # ✅ CHANGED: store reactions as hall_of_fame.total_count
+            # ✅ store reactions as hall_of_fame.total_count
             for idx, (user_id, username, media_c, react_c) in enumerate(top3, start=1):
                 cursor.execute("""
                     INSERT OR REPLACE INTO hall_of_fame
@@ -614,7 +629,6 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
 
     async with db_lock:
         if show_all_time:
-            # ✅ CHANGED: sort by reactions first (then media)
             cursor.execute("""
                 SELECT username, all_media_count, all_react_count
                 FROM users
@@ -624,7 +638,6 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             """, (chat_id, LEADERBOARD_LIMIT))
             rows = cursor.fetchall()
         else:
-            # ✅ CHANGED: sort by reactions first (then media)
             cursor.execute("""
                 SELECT username, media_count, react_count
                 FROM users
@@ -640,7 +653,6 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
         else f"🏆 *Leaderboard — This Month (Top {LEADERBOARD_LIMIT})*"
     )
 
-    # ✅ (optional but consistent) clarify primary ranking
     subtitle = "_❤️ reactions received • 🖼 media (tiebreaker)_"
 
     if not rows:
@@ -676,7 +688,6 @@ async def update_group_leaderboard(
     if stored_raw:
         stored_msg_id, stored_thread_id = _unpack_board_meta(stored_raw)
 
-    # If /board is called in a different topic, move the board there
     if stored_msg_id and preferred_thread_id is not None and stored_thread_id != preferred_thread_id:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=int(stored_msg_id))
@@ -685,7 +696,6 @@ async def update_group_leaderboard(
         stored_msg_id = None
         stored_thread_id = None
 
-    # Try edit existing
     if stored_msg_id:
         try:
             await context.bot.edit_message_text(
@@ -701,7 +711,6 @@ async def update_group_leaderboard(
             stored_msg_id = None
             stored_thread_id = None
 
-    # Create new message in the preferred topic
     try:
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -714,12 +723,10 @@ async def update_group_leaderboard(
         print("send_group_leaderboard failed:", repr(e))
         return
 
-    # Store message_id + thread_id
     async with db_lock:
         _set_meta_sync(key, _pack_board_meta(msg.message_id, preferred_thread_id))
         conn.commit()
 
-    # Try pin
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id, disable_notification=True)
     except Exception:
@@ -957,7 +964,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def render_hof(chat_id: int) -> str:
     async with db_lock:
-        # ✅ CHANGED: include total_count (reactions score) + media_count
         cursor.execute("""
             SELECT month, rank, username, total_count, media_count
             FROM hall_of_fame
@@ -976,7 +982,6 @@ async def render_hof(chat_id: int) -> str:
         if month != current:
             current = month
             out += f"📅 {month}\n"
-        # ✅ CHANGED: show reactions as primary score
         out += f"  {rank_badge(rank)} {username} — ❤️ {reacts}  •  🖼 {media_c}\n"
         if rank == 3:
             out += "\n"
@@ -1163,6 +1168,7 @@ async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM reactions WHERE chat_id = ?", (chat_id,))
         cursor.execute("DELETE FROM message_reaction_totals WHERE chat_id = ?", (chat_id,))
         cursor.execute("DELETE FROM hall_of_fame WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM hof_excluded WHERE chat_id = ?", (chat_id,))
         cursor.execute("DELETE FROM meta WHERE key = ?", (f"group_lb_msg_id:{chat_id}",))
         conn.commit()
 
@@ -1172,6 +1178,135 @@ async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(
             chat.id,
             "✅ Reset stats for this group and refreshed the board.",
+            message_thread_id=thread_id_from_update(update),
+        )
+        schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Hall of Fame exclusion (group admin)
+# ----------------------------
+async def excludehof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin (group): exclude a user from Hall of Fame eligibility."""
+    await safe_delete_message(update.message)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        try:
+            msg = await context.bot.send_message(
+                chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update)
+            )
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    target_id = None
+
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+
+    if target_id is None and (context.args or []):
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        try:
+            msg = await context.bot.send_message(
+                chat.id,
+                "Usage:\n• Reply to a user's message with `/excludehof`\n• Or: `/excludehof <user_id>`",
+                parse_mode="Markdown",
+                message_thread_id=thread_id_from_update(update),
+            )
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    async with db_lock:
+        cursor.execute("""
+            INSERT OR IGNORE INTO hof_excluded (chat_id, user_id)
+            VALUES (?, ?)
+        """, (chat.id, target_id))
+        conn.commit()
+
+    try:
+        msg = await context.bot.send_message(
+            chat.id,
+            f"🚫 User `{target_id}` will no longer count toward Hall of Fame rankings.",
+            parse_mode="Markdown",
+            message_thread_id=thread_id_from_update(update),
+        )
+        schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+    except Exception:
+        pass
+
+
+async def includehof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin (group): re-include a user for Hall of Fame eligibility."""
+    await safe_delete_message(update.message)
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        try:
+            msg = await context.bot.send_message(
+                chat.id, "❌ Admins only.", message_thread_id=thread_id_from_update(update)
+            )
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    target_id = None
+
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+
+    if target_id is None and (context.args or []):
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            target_id = None
+
+    if not target_id:
+        try:
+            msg = await context.bot.send_message(
+                chat.id,
+                "Usage:\n• Reply to a user's message with `/includehof`\n• Or: `/includehof <user_id>`",
+                parse_mode="Markdown",
+                message_thread_id=thread_id_from_update(update),
+            )
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    async with db_lock:
+        cursor.execute("""
+            DELETE FROM hof_excluded
+            WHERE chat_id = ? AND user_id = ?
+        """, (chat.id, target_id))
+        conn.commit()
+
+    try:
+        msg = await context.bot.send_message(
+            chat.id,
+            f"✅ User `{target_id}` is eligible for Hall of Fame again.",
+            parse_mode="Markdown",
             message_thread_id=thread_id_from_update(update),
         )
         schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
@@ -1245,7 +1380,6 @@ async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ✅ Create/refresh board in the SAME topic the command was typed in
     tid = thread_id_from_update(update)
     await update_group_leaderboard(context, chat.id, preferred_thread_id=tid)
 
@@ -1379,6 +1513,8 @@ async def post_init(app):
             BotCommand("forceaward", "Admin (group): award pending media"),
             BotCommand("setgroup", "Admin (group): set this group as default"),
             BotCommand("resetstats", "Admin (group): reset stats for this group"),
+            BotCommand("excludehof", "Admin (group): exclude a user from Hall of Fame eligibility"),
+            BotCommand("includehof", "Admin (group): re-include a user for Hall of Fame eligibility"),
         ])
     except Exception:
         pass
@@ -1412,6 +1548,8 @@ def main():
     app.add_handler(CommandHandler("forceaward", forceaward))
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("resetstats", resetstats))
+    app.add_handler(CommandHandler("excludehof", excludehof))
+    app.add_handler(CommandHandler("includehof", includehof))
 
     app.add_handler(CallbackQueryHandler(on_button))
 
