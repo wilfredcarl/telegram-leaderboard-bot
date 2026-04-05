@@ -2,6 +2,7 @@ import os
 import sqlite3
 import time as time_mod
 import asyncio
+import math
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,9 @@ DB_PATH = os.getenv("DB_PATH", "/data/leaderboard.db")
 
 # ✅ Leaderboard size (Top 10)
 LEADERBOARD_LIMIT = 10
+
+# ✅ All-time quality score eligibility
+MIN_SCORE_POSTS = 3
 
 
 def parse_int_env(name: str, default: int = 0) -> int:
@@ -505,7 +509,8 @@ def help_text() -> str:
         "• `/resetstats` — Reset stats for this group (admin)\n\n"
         "*Hall of Fame Admin*\n"
         "• `/excludehof` — Exclude a user from Hall of Fame eligibility (admin)\n"
-        "• `/includehof` — Re-include a user for Hall of Fame eligibility (admin)\n\n"
+        "• `/includehof` — Re-include a user for Hall of Fame eligibility (admin)\n"
+        "• `/qualityscores` — Show all-time quality + quantity scores (admin)\n\n"
         "*Admin*\n"
         "• `/forceaward` — Award pending media\n\n"
         "⏳ Media counts *24 hours after posting*."
@@ -561,6 +566,14 @@ def _previous_month_key() -> str:
     now = datetime.now(TZ)
     prev_month_day = now.replace(day=1) - timedelta(days=1)
     return prev_month_day.strftime("%Y-%m")
+
+
+def _month_key_from_utc(ts: int) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m")
+
+
+def _is_message_from_current_month(created_at_utc: int) -> bool:
+    return _month_key_from_utc(created_at_utc) == _current_month_key()
 
 
 async def ensure_month_is_current():
@@ -665,6 +678,52 @@ async def render_leaderboard(chat_id: int, show_all_time: bool) -> str:
             f"{rank_badge(i)} *{name}*\n"
             f"   ❤️ {react_c}  •  🖼 {media_c}\n\n"
         )
+    return out.strip()
+
+
+# ----------------------------
+# All-time quality + quantity scores (admin-only view)
+# ----------------------------
+async def render_quality_quantity_scores(chat_id: int) -> str:
+    async with db_lock:
+        cursor.execute("""
+            SELECT user_id, username, all_media_count, all_react_count
+            FROM users
+            WHERE chat_id = ?
+              AND all_media_count >= ?
+        """, (chat_id, MIN_SCORE_POSTS))
+        rows = cursor.fetchall()
+
+    scored = []
+    for user_id, username, media_c, react_c in rows:
+        if media_c <= 0:
+            continue
+        score = react_c / math.sqrt(media_c)
+        scored.append((user_id, username, media_c, react_c, score))
+
+    scored.sort(key=lambda x: (x[4], x[3], x[2]), reverse=True)
+    scored = scored[:LEADERBOARD_LIMIT]
+
+    if not scored:
+        return (
+            "📈 *Quality + Quantity Scores — All-Time*\n\n"
+            f"No eligible users yet.\n"
+            f"Minimum matured media posts required: {MIN_SCORE_POSTS}"
+        )
+
+    out = (
+        "📈 *Quality + Quantity Scores — All-Time*\n"
+        "_Score = ❤️ all-time reactions ÷ √🖼 all-time media_\n"
+        f"_Minimum {MIN_SCORE_POSTS} matured media posts_\n\n"
+    )
+
+    for i, (_, username, media_c, react_c, score) in enumerate(scored, start=1):
+        name = username or "Unknown"
+        out += (
+            f"{rank_badge(i)} *{name}*\n"
+            f"   ⭐ {score:.2f}  •  ❤️ {react_c}  •  🖼 {media_c}\n\n"
+        )
+
     return out.strip()
 
 
@@ -775,7 +834,9 @@ async def track_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------
-# Reaction tracking (reactions received)
+# Reaction tracking
+# Monthly react_count only counts reactions on posts created this month
+# All-time react_count still counts everything
 # ----------------------------
 async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mr = getattr(update, "message_reaction", None)
@@ -804,7 +865,9 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with db_lock:
         cursor.execute("""
-            SELECT author_id, COALESCE(author_username, 'Unknown')
+            SELECT author_id,
+                   COALESCE(author_username, 'Unknown'),
+                   created_at_utc
             FROM messages
             WHERE chat_id = ? AND message_id = ?
         """, (chat_id, message_id))
@@ -812,8 +875,10 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             return
 
-        author_id, author_username = row
+        author_id, author_username, message_created_at_utc = row
         _ensure_user_row(chat_id, author_id, author_username)
+
+        count_for_monthly = _is_message_from_current_month(int(message_created_at_utc))
 
         for emoji in added:
             cursor.execute("""
@@ -823,13 +888,21 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, (chat_id, message_id, reactor_id, emoji, now))
 
             if cursor.rowcount:
-                cursor.execute("""
-                    UPDATE users
-                    SET react_count = react_count + 1,
-                        all_react_count = all_react_count + 1,
-                        username = ?
-                    WHERE chat_id = ? AND user_id = ?
-                """, (author_username, chat_id, author_id))
+                if count_for_monthly:
+                    cursor.execute("""
+                        UPDATE users
+                        SET react_count = react_count + 1,
+                            all_react_count = all_react_count + 1,
+                            username = ?
+                        WHERE chat_id = ? AND user_id = ?
+                    """, (author_username, chat_id, author_id))
+                else:
+                    cursor.execute("""
+                        UPDATE users
+                        SET all_react_count = all_react_count + 1,
+                            username = ?
+                        WHERE chat_id = ? AND user_id = ?
+                    """, (author_username, chat_id, author_id))
 
                 cursor.execute("""
                     INSERT INTO message_reaction_totals (chat_id, message_id, total_reactions)
@@ -845,13 +918,21 @@ async def track_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, (chat_id, message_id, reactor_id, emoji))
 
             if cursor.rowcount:
-                cursor.execute("""
-                    UPDATE users
-                    SET react_count = MAX(react_count - 1, 0),
-                        all_react_count = MAX(all_react_count - 1, 0),
-                        username = ?
-                    WHERE chat_id = ? AND user_id = ?
-                """, (author_username, chat_id, author_id))
+                if count_for_monthly:
+                    cursor.execute("""
+                        UPDATE users
+                        SET react_count = MAX(react_count - 1, 0),
+                            all_react_count = MAX(all_react_count - 1, 0),
+                            username = ?
+                        WHERE chat_id = ? AND user_id = ?
+                    """, (author_username, chat_id, author_id))
+                else:
+                    cursor.execute("""
+                        UPDATE users
+                        SET all_react_count = MAX(all_react_count - 1, 0),
+                            username = ?
+                        WHERE chat_id = ? AND user_id = ?
+                    """, (author_username, chat_id, author_id))
 
                 cursor.execute("""
                     INSERT INTO message_reaction_totals (chat_id, message_id, total_reactions)
@@ -1394,6 +1475,43 @@ async def board(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def qualityscores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_delete_message(update.message)
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ("administrator", "creator"):
+        try:
+            msg = await context.bot.send_message(
+                chat.id,
+                "❌ Admins only.",
+                message_thread_id=thread_id_from_update(update),
+            )
+            schedule_delete(context, chat.id, msg.message_id, DM_NOTICE_SECONDS)
+        except Exception:
+            pass
+        return
+
+    text = await render_quality_quantity_scores(chat.id)
+
+    try:
+        msg = await context.bot.send_message(
+            chat.id,
+            text,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            message_thread_id=thread_id_from_update(update),
+        )
+        schedule_delete(context, chat.id, msg.message_id, 30)
+    except Exception:
+        pass
+
+
 # ----------------------------
 # Buttons (DM)
 # ----------------------------
@@ -1515,6 +1633,7 @@ async def post_init(app):
             BotCommand("resetstats", "Admin (group): reset stats for this group"),
             BotCommand("excludehof", "Admin (group): exclude a user from Hall of Fame eligibility"),
             BotCommand("includehof", "Admin (group): re-include a user for Hall of Fame eligibility"),
+            BotCommand("qualityscores", "Admin (group): show all-time quality + quantity scores"),
         ])
     except Exception:
         pass
@@ -1550,6 +1669,7 @@ def main():
     app.add_handler(CommandHandler("resetstats", resetstats))
     app.add_handler(CommandHandler("excludehof", excludehof))
     app.add_handler(CommandHandler("includehof", includehof))
+    app.add_handler(CommandHandler("qualityscores", qualityscores))
 
     app.add_handler(CallbackQueryHandler(on_button))
 
